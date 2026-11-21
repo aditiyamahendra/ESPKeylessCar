@@ -330,6 +330,7 @@ void extractBondedIRKs() {
         if (addedNew || matchedExisting) {
             blinkLed(addedNew ? 3 : 2, 150);
             isPairingWindow = false;
+            lastActivityMs = millis();      // start the 2-minute fast-scan period from the moment pairing finishes
             BLEDevice::getAdvertising()->stop();
             Serial.println("🔵 Pairing complete -> starting proximity scan immediately");
         }
