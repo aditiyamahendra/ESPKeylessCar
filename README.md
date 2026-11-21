@@ -25,7 +25,7 @@ smartwatches and beacons), and adds power-saving and safety changes.
 - The original powered a spare key fob and pressed its buttons electrically.
   This fork instead drives two **active-LOW relays** with a 400 ms pulse
   (GPIO 4 = lock, GPIO 5 = unlock), wired to the lock/unlock inputs of a
-  Wuling Confero K15D body control module.
+  Car Central Lock control module.
 - Onboard LED on GPIO 8, mode button on GPIO 9.
 - Unlock happens when the best matching key's RSSI is at or above the unlock
   threshold. Lock happens after a configurable number of weak/missing scans
