@@ -6,8 +6,11 @@ BLE Identity Resolution Keys (IRKs). Credit for the original design and the
 IRK pairing approach goes to the original author.
 
 This fork adapts the project to an **ESP32-C3 SuperMini** driving a car's
-central-lock module through relays, and extends it to support many more keys,
-including smartwatches and beacons.
+central-lock module through relays, supports many more keys (including
+smartwatches and beacons), and adds power-saving and safety changes.
+
+> Sections below the divider are from the original project. Where they describe
+> different hardware, setup steps or passwords, this section applies.
 
 ## What's changed from the original
 
@@ -18,66 +21,107 @@ including smartwatches and beacons.
 - Removed the hardcoded `COM4` upload/monitor ports and the custom upload speed,
   so PlatformIO auto-detects the port.
 
-### Pinout and lock control (`src/main.cpp`)
-- Lock and unlock are driven by two **active-LOW relay** outputs with a 400 ms
-  pulse (GPIO 4 = lock, GPIO 5 = unlock), wired to the lock/unlock inputs of a
-  Car central lock control module.
-- Onboard LED on GPIO 8, exterior push button on GPIO 9.
+### Lock control (`src/main.cpp`)
+- The original powered a spare key fob and pressed its buttons electrically.
+  This fork instead drives two **active-LOW relays** with a 400 ms pulse
+  (GPIO 4 = lock, GPIO 5 = unlock), wired to the lock/unlock inputs of a
+  Wuling Confero K15D body control module.
+- Onboard LED on GPIO 8, mode button on GPIO 9.
 - Unlock happens when the best matching key's RSSI is at or above the unlock
   threshold. Lock happens after a configurable number of weak/missing scans
   **and** a configurable timeout.
 
 ### More keys, and new key types (`src/storage.h`, `src/main.cpp`)
-- **Up to 30 paired IRK devices** (phones, watches that pair through BLE),
+- **Up to 30 paired IRK devices** (phones, and watches that pair over BLE),
   up from 10.
 - **Up to 30 static-MAC "passive keys"** (smartwatches, beacons) that don't
   use IRKs. Each can be added, renamed, enabled/disabled and deleted.
 - A single scan callback checks both key types and uses the strongest match.
 - Pairing uses "Just Works" with no PIN. IRKs are extracted from bonds and the
   Bluedroid bond table is cleared after each extraction, so many devices can
-  be paired one after another. Flash saves are deferred out of the BLE callback
-  to avoid watchdog crashes.
+  be paired one after another. Flash saves are deferred out of the BLE
+  callback to avoid watchdog crashes.
 - Settings (unlock RSSI, lock RSSI, lock delay, weak-signal count) and the
-  Wi-Fi credentials are stored persistently.
+  Wi-Fi client credentials are stored persistently in NVS.
 
-### New Wi-Fi dashboard (`src/wifi_manager.h`)
+### Pairing is opt-in
+- The 30-second BLE pairing window **no longer opens on every boot**. It opens
+  only after you tap **Reboot to pair** in the dashboard, or when no keys are
+  stored yet (first-time setup).
+- The request is a one-shot flag that is cleared as soon as it is read, so a
+  crash or watchdog reboot can never reopen pairing.
+
+### Wi-Fi dashboard (`src/wifi_manager.h`)
 Rewritten as a self-contained dashboard that replaces the original Wi-Fi manager.
 
-- **Hold the exterior button for 1 second** to switch between BLE keyless mode
-  and Wi-Fi dashboard mode. The dashboard shuts itself down after 3 minutes.
+- **Hold the mode button for 1 second** to switch between BLE keyless mode
+  and Wi-Fi dashboard mode. The dashboard closes itself after 3 minutes.
 - The ESP32 starts an access point (`ESPKV7-Keyless`) with a **captive portal**
   that opens automatically on iOS, Android and Windows.
 - Page `/`: manage paired IRK devices (rename, delete), adjust proximity
   settings, configure an optional Wi-Fi client connection (with a scan
-  dropdown), and reboot into the 30-second pairing window.
-- Page `/keys`: add and manage static-MAC keys, including a "Scan" button that
+  dropdown), and **Reboot to pair**.
+- Page `/keys`: add and manage static-MAC keys, with a "Scan" button that
   lists nearby BLE devices to pick from.
+- Leaving the dashboard (Resume BLE, the button, or the timeout) restarts the
+  controller for a clean BLE start. The car's lock state is not remembered
+  across restarts, so you may see one extra unlock pulse if a key is nearby.
 
-### Removed
-- The original's audit log and NTP time sync are no longer part of the main
-  program, and the old `web_server.h` / `audit_log.h` modules are no longer
-  included.
+### Power saving
+- **CPU clock:** 80 MHz during normal keyless operation, 160 MHz only while the
+  Wi-Fi dashboard is open.
+- **Adaptive scan duty cycle:** fast scan (100 ms interval / 99 ms window)
+  while the car is unlocked or within 2 minutes of a key sighting or lock/unlock
+  pulse. Otherwise **eco-scan** (500 ms / 120 ms, about 24% receiver duty).
+  Any registered key seen at -90 dBm or stronger switches back to fast scan.
+- All timings are constants at the top of `src/main.cpp`.
+- Scanning is passive (no scan requests are transmitted).
+- Not measured: no current-draw figures are claimed.
+
+### Reliability
+- A 30-second **task watchdog** reboots the controller if the main loop hangs.
+
+### Replaced or removed from the original
+- Key-fob emulation (fob power pin and button pins), replaced by the relays above.
+- The audit log and NTP time sync, and the old `web_server.h` / `audit_log.h`
+  modules are no longer used.
+- Per-device weak-signal tracking and EEPROM storage with migration; this fork
+  uses NVS only, so devices saved by the original firmware will not carry over.
 
 ## Setup
 
 ```bash
 git clone https://github.com/aditiyamahendra/ESPKeylessCar
 cd ESPKeylessCar
+
+# Create your private Wi-Fi password file (git-ignored)
+cp src/secrets.h.example src/secrets.h
+# edit src/secrets.h and set AP_PASSWORD (8-63 characters)
+
 pio run --target upload
 pio device monitor
 ```
 
+The build fails with a clear message if `src/secrets.h` is missing or the
+password length is invalid.
+
 ## Notes and limitations
 
-- The dashboard has no login, and the access point password is set in
-  `src/wifi_manager.h`. **Change it before using this on a real vehicle.**
+- The dashboard has no login. It is only reachable after holding the mode
+  button, for at most 3 minutes, and the access point is protected by the
+  password in `src/secrets.h`. Mount the button where it cannot be reached
+  casually, and use a strong, unique password.
 - Static-MAC keys (watches, beacons) can be spoofed more easily than IRK-based
   keys, since the address never changes.
+- Proximity unlock based on signal strength can be defeated by relay attacks.
+  This is inherent to the approach.
 - This project controls vehicle access. Use it at your own risk.
 
 ## Upstream
 
 Original project: https://github.com/crazyhoesl/ESPKeylessCar
+
+---------------------------------------------------------------------------------
 
 # ESP32 Dynamic iPhone Keyless System v7.2
 
