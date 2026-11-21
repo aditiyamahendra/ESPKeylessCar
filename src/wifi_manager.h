@@ -6,6 +6,18 @@
 #include <ESPmDNS.h>
 #include "storage.h"
 
+// Wi-Fi dashboard AP password lives in src/secrets.h (git-ignored).
+// Copy src/secrets.h.example to src/secrets.h and set your own password.
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#else
+  #error "Missing src/secrets.h - copy src/secrets.h.example to src/secrets.h and set AP_PASSWORD"
+#endif
+
+// WPA2 requires 8-63 characters (sizeof includes the trailing NUL)
+static_assert(sizeof(AP_PASSWORD) >= 9 && sizeof(AP_PASSWORD) <= 64,
+              "AP_PASSWORD in secrets.h must be 8-63 characters");
+
 #define MAX_NEARBY_BLE  12
 #define MAX_WIFI_SCANS  12
 
@@ -1474,7 +1486,7 @@ public:
 
         IPAddress apIP(192, 168, 4, 1);
         WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-        WiFi.softAP("ESPKV7-Keyless", "12345678", 1, 0, 4);
+        WiFi.softAP("ESPKV7-Keyless", AP_PASSWORD, 1, 0, 4);
         delay(150);
 
         // 15 dBm avoids ESP32-C3 SuperMini antenna overload during iOS WPA2 handshake

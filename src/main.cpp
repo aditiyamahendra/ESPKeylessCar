@@ -5,6 +5,7 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 #include "esp_gap_ble_api.h"
+#include "esp_task_wdt.h"
 #include "mbedtls/aes.h"
 #include "storage.h"
 #include "wifi_manager.h"
@@ -23,8 +24,23 @@ const int WIFI_BUTTON_PIN = 9;   // Exterior Push Button / BOOT (INPUT_PULLUP)
 #define FITNESS_APPEARANCE     0x0340
 
 const unsigned long RELAY_PULSE_MS     = 400;   // 400 ms negative trigger pulse
-const unsigned long PAIRING_WINDOW_MS  = 30000; // 30s BLE pairing window on boot
+const unsigned long PAIRING_WINDOW_MS  = 30000; // 30s BLE pairing window (only when requested from dashboard, or no keys stored yet)
 const unsigned long BUTTON_HOLD_MS     = 1000;  // 1s hold to toggle Wi-Fi <-> BLE
+
+// --- Power / efficiency tuning --------------------------------------------
+const uint32_t CPU_MHZ_BLE_MODE  = 80;    // normal keyless operation
+const uint32_t CPU_MHZ_WIFI_MODE = 160;   // while the Wi-Fi dashboard is open
+
+// BLEScan setters take MILLISECONDS (the library converts to 0.625 ms units itself)
+const uint16_t SCAN_ACTIVE_INTERVAL_MS = 100;  // fast scan: ~99% RX duty
+const uint16_t SCAN_ACTIVE_WINDOW_MS   = 99;
+const uint16_t SCAN_ECO_INTERVAL_MS    = 500;  // eco scan: ~24% RX duty
+const uint16_t SCAN_ECO_WINDOW_MS      = 120;
+const unsigned long ECO_IDLE_AFTER_MS  = 120000; // 2 min without activity -> eco scan
+const int ECO_WAKE_RSSI                = -90;    // a registered key at/above this wakes fast scan
+
+// --- Watchdog ---------------------------------------------------------------
+const uint32_t WDT_TIMEOUT_S = 30;        // main loop must check in at least this often
 
 // ============================================================================
 // Global State
@@ -35,8 +51,12 @@ BLEScan* pBLEScan = nullptr;
 BLEServer* pBLEServer = nullptr;
 
 bool isWifiMode = false;
-bool isPairingWindow = true;
+bool isPairingWindow = false;   // opened only by startBleMode(true) or when no keys are stored
 unsigned long bootTimeMs = 0;
+
+// Adaptive scan state (lastActivityMs is also written from the BLE scan callback)
+volatile unsigned long lastActivityMs = 0;
+bool ecoScanActive = false;
 
 bool isCarUnlocked = false;
 unsigned long lastStrongSeenMs = 0;
@@ -70,6 +90,7 @@ void sendLockPulse() {
     digitalWrite(LOCK_PIN, LOW);
     delay(RELAY_PULSE_MS);
     digitalWrite(LOCK_PIN, HIGH);
+    lastActivityMs = millis();
 }
 
 void sendUnlockPulse() {
@@ -77,6 +98,7 @@ void sendUnlockPulse() {
     digitalWrite(UNLOCK_PIN, LOW);
     delay(RELAY_PULSE_MS);
     digitalWrite(UNLOCK_PIN, HIGH);
+    lastActivityMs = millis();
 }
 
 String formatTimestamp() {
@@ -123,8 +145,24 @@ bool verifyRPA(const uint8_t addr[6], const uint8_t irk[16]) {
 // ============================================================================
 // Real-Time Unified BLE Scan Callback (IRK Phones + Static-MAC Watches)
 // ============================================================================
+#ifdef RPA_TIMING_DEBUG
+volatile uint32_t cbMaxMicros = 0;   // worst-case time spent in onResult (add -DRPA_TIMING_DEBUG to build_flags)
+#endif
+
 class KeylessScanCallbacks : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) override {
+#ifdef RPA_TIMING_DEBUG
+        uint32_t t0 = micros();
+#endif
+        handleAdvertisement(advertisedDevice);
+#ifdef RPA_TIMING_DEBUG
+        uint32_t dt = micros() - t0;
+        if (dt > cbMaxMicros) cbMaxMicros = dt;
+#endif
+    }
+
+private:
+    void handleAdvertisement(BLEAdvertisedDevice& advertisedDevice) {
         esp_bd_addr_t* nativeAddr = advertisedDevice.getAddress().getNative();
         int rssi = advertisedDevice.getRSSI();
 
@@ -132,6 +170,7 @@ class KeylessScanCallbacks : public BLEAdvertisedDeviceCallbacks {
         for (int d = 0; d < MAX_IRK_DEVICES; d++) {
             if (!storage.irkDevices[d].used) continue;
             if (verifyRPA(*nativeAddr, storage.irkDevices[d].irk)) {
+                if (rssi >= ECO_WAKE_RSSI) lastActivityMs = millis();   // wake fast scan
                 if (rssi > scanBestRssi) {
                     scanBestRssi = rssi;
                     strncpy(scanMatchedName, storage.irkDevices[d].name, sizeof(scanMatchedName) - 1);
@@ -145,6 +184,7 @@ class KeylessScanCallbacks : public BLEAdvertisedDeviceCallbacks {
         for (int k = 0; k < MAX_PASSIVE_KEYS; k++) {
             if (!storage.passiveKeys[k].used || !storage.passiveKeys[k].enabled) continue;
             if (memcmp(*nativeAddr, storage.passiveKeys[k].mac, 6) == 0) {
+                if (rssi >= ECO_WAKE_RSSI) lastActivityMs = millis();   // wake fast scan
                 if (rssi > scanBestRssi) {
                     scanBestRssi = rssi;
                     strncpy(scanMatchedName, storage.passiveKeys[k].name, sizeof(scanMatchedName) - 1);
@@ -315,11 +355,26 @@ void clearResidualBluedroidBonds() {
 }
 
 // ============================================================================
+// Adaptive scan duty cycle (fast <-> eco). Params apply on the next scan start().
+// ============================================================================
+void applyScanMode(bool eco) {
+    if (pBLEScan == nullptr || eco == ecoScanActive) return;
+    ecoScanActive = eco;
+    pBLEScan->setInterval(eco ? SCAN_ECO_INTERVAL_MS : SCAN_ACTIVE_INTERVAL_MS);
+    pBLEScan->setWindow(eco ? SCAN_ECO_WINDOW_MS : SCAN_ACTIVE_WINDOW_MS);
+    Serial.println(eco ? "🌿 Eco-scan ON (locked, no key seen for 2+ min)"
+                       : "⚡ Fast scan ON");
+}
+
+// ============================================================================
 // Mutually Exclusive BLE <-> Wi-Fi Radio State Machine
 // ============================================================================
 void startBleMode(bool enablePairing) {
     wifiManager.stop();
     isWifiMode = false;
+
+    // Radios are off here, so it is safe to drop the CPU clock before BLE comes up
+    setCpuFrequencyMhz(CPU_MHZ_BLE_MODE);
 
     BLEDevice::init("ESPKV7 Tracker");
     esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P6);
@@ -366,9 +421,11 @@ void startBleMode(bool enablePairing) {
 
     pBLEScan = BLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(&scanCallbacks, true);
-    pBLEScan->setActiveScan(false);
-    pBLEScan->setInterval(100);
-    pBLEScan->setWindow(99);
+    pBLEScan->setActiveScan(false);   // passive scan: no scan-request TX, saves power
+    ecoScanActive = false;
+    pBLEScan->setInterval(SCAN_ACTIVE_INTERVAL_MS);
+    pBLEScan->setWindow(SCAN_ACTIVE_WINDOW_MS);
+    lastActivityMs = millis();        // start in fast scan, eco kicks in after 2 idle minutes
 }
 
 void enterWifiMode() {
@@ -382,11 +439,23 @@ void enterWifiMode() {
     captureNearbyBleSnapshot(2);
 
     pBLEScan = nullptr;
-    BLEDevice::deinit(true);
+    BLEDevice::deinit(false);   // false: keep BT memory so BLEDevice::init() can be called again
     pBLEServer = nullptr;
 
+    esp_task_wdt_reset();
+    setCpuFrequencyMhz(CPU_MHZ_WIFI_MODE);   // BLE is off; give Wi-Fi/web server full speed
     isWifiMode = true;
     wifiManager.begin(&storage);
+    esp_task_wdt_reset();
+}
+
+// Leaving Wi-Fi mode: restart instead of re-initialising BLE in place. A fresh boot gives the
+// radio/BT stack a clean state (and sets the 80 MHz clock). No pairing flag is set, so the
+// pairing window stays closed unless keys are missing.
+void returnToBleMode() {
+    Serial.println("🔵 Returning to BLE Keyless Mode (clean restart)...");
+    delay(250);
+    ESP.restart();
 }
 
 // ============================================================================
@@ -405,7 +474,7 @@ void checkWifiToggleButton() {
             if (!isWifiMode) {
                 enterWifiMode();
             } else {
-                startBleMode(false);
+                returnToBleMode();
             }
         }
     } else {
@@ -423,6 +492,8 @@ void setup() {
     pinMode(LOCK_PIN, OUTPUT);
     pinMode(UNLOCK_PIN, OUTPUT);
 
+    setCpuFrequencyMhz(CPU_MHZ_BLE_MODE);   // before Serial.begin so UART/USB timing is set once
+
     pinMode(LED_PIN, OUTPUT);
     setLed(false);
 
@@ -437,11 +508,21 @@ void setup() {
                   storage.irkCount, MAX_IRK_DEVICES,
                   storage.passiveCount, MAX_PASSIVE_KEYS);
 
+    // Watchdog: reboot if loop() stops checking in for WDT_TIMEOUT_S seconds
+    esp_err_t wdtErr = esp_task_wdt_init(WDT_TIMEOUT_S, true);
+    if (wdtErr == ESP_OK) wdtErr = esp_task_wdt_add(NULL);
+    Serial.printf("🐕 Watchdog %s (%us timeout)\n",
+                  wdtErr == ESP_OK ? "enabled" : "FAILED to enable", (unsigned)WDT_TIMEOUT_S);
+
+    // Pairing window opens ONLY if requested from the dashboard ("Reboot to pair"),
+    // or if no keys exist yet (first-time setup). A plain/crash/watchdog reboot never opens it.
+    bool pairRequested = storage.consumePairRequest();
     bootTimeMs = millis();
-    startBleMode(true);
+    startBleMode(pairRequested);
 }
 
 void loop() {
+    esp_task_wdt_reset();
     checkWifiToggleButton();
 
     // ------------------------------------------------------------------------
@@ -465,20 +546,19 @@ void loop() {
             wifiManager.suspendForBleScan();
             BLEDevice::init("");
             captureNearbyBleSnapshot(3);
-            BLEDevice::deinit(true);
+            BLEDevice::deinit(false);
             wifiManager.resumeAfterBleScan();
         }
 
         if (wifiManager.rebootRequested) {
             Serial.println("🔄 Rebooting to open 30s BLE pairing window...");
+            storage.setPairRequest(true);   // consumed (and cleared) on next boot
             delay(350);
             ESP.restart();
         }
 
         if (wifiManager.resumeBleRequested || wifiManager.isTimedOut()) {
-            Serial.println("🔵 Returning to BLE Keyless Mode...");
-            delay(250);
-            startBleMode(false);
+            returnToBleMode();
         }
         return;
     }
@@ -497,6 +577,7 @@ void loop() {
             isPairingWindow = false;
             BLEDevice::getAdvertising()->stop();
             Serial.println("🔒 30-second pairing window closed -> scanning started");
+            lastActivityMs = millis();
         } else {
             static unsigned long lastWaitLogMs = 0;
             if (millis() - lastWaitLogMs >= 5000) {
@@ -512,6 +593,21 @@ void loop() {
             return;
         }
     }
+
+    // Fast scan while unlocked or within ECO_IDLE_AFTER_MS of any key sighting / relay pulse;
+    // otherwise eco-scan (~24% RX duty) to cut radio power.
+    bool wantFast = isCarUnlocked || (millis() - lastActivityMs < ECO_IDLE_AFTER_MS);
+    applyScanMode(!wantFast);
+
+#ifdef RPA_TIMING_DEBUG
+    static unsigned long lastTimingLogMs = 0;
+    if (millis() - lastTimingLogMs >= 10000) {
+        lastTimingLogMs = millis();
+        Serial.printf("⏱ Worst scan-callback time: %u us (%d IRK + %d passive keys)\n",
+                      (unsigned)cbMaxMicros, storage.irkCount, storage.passiveCount);
+        cbMaxMicros = 0;
+    }
+#endif
 
     // Run 1-second passive BLE scan across up to 30 IRK phones + 30 Static-MAC keys
     scanBestRssi = -127;

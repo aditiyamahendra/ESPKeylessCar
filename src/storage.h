@@ -77,6 +77,16 @@ public:
         loadPassiveKeys();
     }
 
+    // One-shot "open the BLE pairing window on next boot" flag.
+    // It is cleared the moment it is read, so a crash/watchdog reboot can never reopen pairing.
+    void setPairRequest(bool v) { prefs.putBool("pair_req", v); }
+
+    bool consumePairRequest() {
+        bool v = prefs.getBool("pair_req", false);
+        if (v) prefs.putBool("pair_req", false);
+        return v;
+    }
+
     void saveSettings() {
         prefs.putInt("u_rssi", settings.unlockRssi);
         prefs.putInt("l_rssi", settings.lockRssi);
