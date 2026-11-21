@@ -1,3 +1,84 @@
+# ESPKeylessCar (fork)
+
+This is a fork of [crazyhoesl/ESPKeylessCar](https://github.com/crazyhoesl/ESPKeylessCar),
+an ESP32 proximity-based keyless entry system that recognizes phones by their
+BLE Identity Resolution Keys (IRKs). Credit for the original design and the
+IRK pairing approach goes to the original author.
+
+This fork adapts the project to an **ESP32-C3 SuperMini** driving a car's
+central-lock module through relays, and extends it to support many more keys,
+including smartwatches and beacons.
+
+## What's changed from the original
+
+### Hardware and build (`platformio.ini`)
+- Target board changed from `esp32dev` to **ESP32-C3 SuperMini**
+  (`board = esp32-c3-devkitm-1`), with the platform pinned to `espressif32 @ 6.10.0`.
+- USB-CDC serial enabled (`ARDUINO_USB_MODE=1`, `ARDUINO_USB_CDC_ON_BOOT=1`).
+- Removed the hardcoded `COM4` upload/monitor ports and the custom upload speed,
+  so PlatformIO auto-detects the port.
+
+### Pinout and lock control (`src/main.cpp`)
+- Lock and unlock are driven by two **active-LOW relay** outputs with a 400 ms
+  pulse (GPIO 4 = lock, GPIO 5 = unlock), wired to the lock/unlock inputs of a
+  Car central lock control module.
+- Onboard LED on GPIO 8, exterior push button on GPIO 9.
+- Unlock happens when the best matching key's RSSI is at or above the unlock
+  threshold. Lock happens after a configurable number of weak/missing scans
+  **and** a configurable timeout.
+
+### More keys, and new key types (`src/storage.h`, `src/main.cpp`)
+- **Up to 30 paired IRK devices** (phones, watches that pair through BLE),
+  up from 10.
+- **Up to 30 static-MAC "passive keys"** (smartwatches, beacons) that don't
+  use IRKs. Each can be added, renamed, enabled/disabled and deleted.
+- A single scan callback checks both key types and uses the strongest match.
+- Pairing uses "Just Works" with no PIN. IRKs are extracted from bonds and the
+  Bluedroid bond table is cleared after each extraction, so many devices can
+  be paired one after another. Flash saves are deferred out of the BLE callback
+  to avoid watchdog crashes.
+- Settings (unlock RSSI, lock RSSI, lock delay, weak-signal count) and the
+  Wi-Fi credentials are stored persistently.
+
+### New Wi-Fi dashboard (`src/wifi_manager.h`)
+Rewritten as a self-contained dashboard that replaces the original Wi-Fi manager.
+
+- **Hold the exterior button for 1 second** to switch between BLE keyless mode
+  and Wi-Fi dashboard mode. The dashboard shuts itself down after 3 minutes.
+- The ESP32 starts an access point (`ESPKV7-Keyless`) with a **captive portal**
+  that opens automatically on iOS, Android and Windows.
+- Page `/`: manage paired IRK devices (rename, delete), adjust proximity
+  settings, configure an optional Wi-Fi client connection (with a scan
+  dropdown), and reboot into the 30-second pairing window.
+- Page `/keys`: add and manage static-MAC keys, including a "Scan" button that
+  lists nearby BLE devices to pick from.
+
+### Removed
+- The original's audit log and NTP time sync are no longer part of the main
+  program, and the old `web_server.h` / `audit_log.h` modules are no longer
+  included.
+
+## Setup
+
+```bash
+git clone https://github.com/aditiyamahendra/ESPKeylessCar
+cd ESPKeylessCar
+pio run --target upload
+pio device monitor
+```
+
+## Notes and limitations
+
+- The dashboard has no login, and the access point password is set in
+  `src/wifi_manager.h`. **Change it before using this on a real vehicle.**
+- Static-MAC keys (watches, beacons) can be spoofed more easily than IRK-based
+  keys, since the address never changes.
+- This project controls vehicle access. Use it at your own risk.
+
+## Upstream
+
+Original project: https://github.com/crazyhoesl/ESPKeylessCar
+
 # ESP32 Dynamic iPhone Keyless System v7.2
 
 🚗 **Smart Proximity-Based Car Access Control using iPhone BLE**
