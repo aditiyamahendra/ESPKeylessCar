@@ -1,964 +1,571 @@
-/*
- * ESP32 Dynamic iPhone Keyless System v7.2
- * Author: crazyhoesl
- * Date: 27. Juli 2025
- * Updated: January 2026 - Added Web Dashboard
- *
- * Features:
- * - Dynamic IRK learning via BLE pairing
- * - Up to 10 devices supported
- * - NVS storage for persistent IRKs + Audit Log
- * - Web Dashboard for device management
- * - WiFi client with NTP time sync
- * - LED status feedback
- * - Full serial debugging
- */
-
 #include <Arduino.h>
 #include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLESecurity.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
-#include <BLEAdvertising.h>
-#include "mbedtls/aes.h"
-#include "esp_task_wdt.h"
 #include "esp_gap_ble_api.h"
-#include "esp_gattc_api.h"
-#include "esp_gatt_defs.h"
-#include "esp_bt_main.h"
-#include "esp_bt_defs.h"
-#include "EEPROM.h"
-
-// New modules for Web Dashboard
+#include "mbedtls/aes.h"
 #include "storage.h"
-#include "audit_log.h"
 #include "wifi_manager.h"
-#include "web_server.h"
 
-// ========================================
-// CONFIGURATION
-// ========================================
-#define MAX_DEVICES 10
-#define EEPROM_SIZE 512
-#define PAIRING_TIMEOUT_MS 30000  // 30 seconds pairing window
+// ============================================================================
+// Hardware Pinout (ESP32-C3 SuperMini -> Wuling Confero K15D BCM)
+// ============================================================================
+const int LOCK_PIN        = 4;   // Active-LOW Relay IN1 -> K15D Pin 19 (Lock)
+const int UNLOCK_PIN      = 5;   // Active-LOW Relay IN2 -> K15D Pin 18 (Unlock)
+const int LED_PIN         = 8;   // Onboard Blue LED (Active-LOW)
+const int WIFI_BUTTON_PIN = 9;   // Exterior Push Button / BOOT (INPUT_PULLUP)
 
-// Pin definitions
-const int LED_PIN = 2;
-const int KEY_POWER_PIN = 23;
-const int LOCK_BUTTON_PIN = 19;
-const int UNLOCK_BUTTON_PIN = 18;
+// 16-bit Heart Rate / Fitness profile required for iOS Settings > Bluetooth discovery
+#define FITNESS_SERVICE_UUID   ((uint16_t)0x180D)
+#define FITNESS_CHAR_UUID      ((uint16_t)0x2A37)
+#define FITNESS_APPEARANCE     0x0340
 
-// BLE Service UUIDs for pairing mode - Health/Fitness device
-#define DEVICE_INFO_SERVICE_UUID    "180A"  // Device Information Service
-#define BATTERY_SERVICE_UUID        "180F"  // Battery Service  
-#define HEART_RATE_SERVICE_UUID     "180D"  // Heart Rate Service (makes it look like fitness tracker)
-#define CHARACTERISTIC_UUID         "2A37"  // Heart Rate Measurement
+const unsigned long RELAY_PULSE_MS     = 400;   // 400 ms negative trigger pulse
+const unsigned long PAIRING_WINDOW_MS  = 30000; // 30s BLE pairing window on boot
+const unsigned long BUTTON_HOLD_MS     = 1000;  // 1s hold to toggle Wi-Fi <-> BLE
 
-// Keyless system parameters
-const int SCAN_TIME = 3;
-// Default values - actual values loaded from storage.settings
-unsigned long PROXIMITY_TIMEOUT = 10000;
-int RSSI_UNLOCK_THRESHOLD = -90;  // Öffnen bei schwächerem Signal (größere Reichweite)
-int RSSI_LOCK_THRESHOLD = -80;    // Schließen bei stärkerem Signal (kleinere Reichweite)
-const unsigned long POWER_OFF_DELAY = 10000;
-const unsigned long UNLOCK_DELAY = 500;
-const unsigned long LOCK_STABILIZATION_DELAY = 10;
+// ============================================================================
+// Global State
+// ============================================================================
+StorageManager storage;
+WifiDashboardManager wifiManager;
+BLEScan* pBLEScan = nullptr;
+BLEServer* pBLEServer = nullptr;
 
-// Hysteresis parameters - WEAK_SIGNAL_THRESHOLD loaded from storage.settings
-int WEAK_SIGNAL_THRESHOLD = 3;
-const unsigned long WEAK_SIGNAL_RESET_TIME = 5000;
+bool isWifiMode = false;
+bool isPairingWindow = true;
+unsigned long bootTimeMs = 0;
 
-// ========================================
-// EEPROM STRUCTURE
-// ========================================
-#define MAGIC_BYTES_ADDR 0
-#define DEVICE_COUNT_ADDR 4
-#define DEVICES_START_ADDR 8
-#define DEVICE_ENTRY_SIZE 32  // 16 bytes IRK + 16 bytes name
-#define MAGIC_VALUE 0xDEADBEEF
+bool isCarUnlocked = false;
+unsigned long lastStrongSeenMs = 0;
+int consecutiveWeakScans = 0;
 
-struct DeviceEntry {
-    uint8_t irk[16];
-    char name[16];
-};
+// Shared per-scan RSSI tracking updated in real time by scan callback
+volatile int scanBestRssi = -127;
+char scanMatchedName[28] = {0};
 
-// ========================================
-// GLOBAL VARIABLES
-// ========================================
+// Deferred flash save flag (prevents single-core watchdog crash inside BLE callback)
+volatile bool pendingBondSync = false;
 
-// System state
-enum SystemMode {
-    MODE_PAIRING,
-    MODE_KEYLESS
-};
-volatile SystemMode currentMode = MODE_PAIRING;
-
-// BLE objects
-BLEServer* pServer = NULL;
-BLEScan* pBLEScan = NULL;
-
-// Pairing state
-bool deviceConnected = false;
-unsigned long pairingStartTime = 0;
-int extractedDeviceCount = 0;
-
-// Device storage
-DeviceEntry knownDevices[MAX_DEVICES];
-int numKnownDevices = 0;
-
-// Keyless system state
-volatile unsigned long lastSeenTime[MAX_DEVICES] = {0};
-volatile bool deviceNearby[MAX_DEVICES] = {false};
-volatile bool anyPhoneNearby = false;
-volatile bool keyPowered = false;
-volatile bool lockTriggered = false;
-volatile bool unlockTriggered = false;
-volatile bool pendingLock = false;
-volatile unsigned long keyPowerTime = 0;
-volatile unsigned long lockTriggerTime = 0;
-
-// Hysteresis per device
-struct DeviceHysteresis {
-    volatile int weakSignalCount;
-    volatile unsigned long lastWeakSignalTime;
-    volatile bool isWeak;
-};
-volatile DeviceHysteresis deviceHysteresis[MAX_DEVICES];
-
-// LED control
-unsigned long lastLedBlink = 0;
-bool ledState = false;
-
-// ========================================
-// WEB DASHBOARD MODULES
-// ========================================
-Storage storage;
-AuditLog auditLog;
-WifiManager wifiManager;
-DashboardServer dashboardServer;
-int lastUnlockDevice = -1;  // Track which device triggered last unlock
-
-// ========================================
-// LED CONTROL FUNCTIONS
-// ========================================
-
-void setLED(bool state) {
-    digitalWrite(LED_PIN, state);
-    ledState = state;
+// ============================================================================
+// Relay & LED Helpers
+// ============================================================================
+void setLed(bool on) {
+    digitalWrite(LED_PIN, on ? LOW : HIGH);
 }
 
-void blinkLED(unsigned long interval) {
-    if (millis() - lastLedBlink >= interval) {
-        setLED(!ledState);
-        lastLedBlink = millis();
+void blinkLed(int times, int delayMs) {
+    for (int i = 0; i < times; i++) {
+        setLed(true);
+        delay(delayMs);
+        setLed(false);
+        delay(delayMs);
     }
 }
 
-void blinkPattern(int count, unsigned long onTime, unsigned long offTime) {
-    for (int i = 0; i < count; i++) {
-        setLED(true);
-        delay(onTime);
-        setLED(false);
-        if (i < count - 1) delay(offTime);
-    }
+void sendLockPulse() {
+    Serial.println("🔒 LOCK pulse sent to Wuling Confero BCM (K15D Pin 19)");
+    digitalWrite(LOCK_PIN, LOW);
+    delay(RELAY_PULSE_MS);
+    digitalWrite(LOCK_PIN, HIGH);
 }
 
-// ========================================
-// EEPROM FUNCTIONS
-// ========================================
-
-void saveDevicesToEEPROM() {
-    Serial.println("💾 Saving devices to EEPROM...");
-    
-    EEPROM.writeULong(MAGIC_BYTES_ADDR, MAGIC_VALUE);
-    EEPROM.writeInt(DEVICE_COUNT_ADDR, numKnownDevices);
-    
-    for (int i = 0; i < numKnownDevices; i++) {
-        int addr = DEVICES_START_ADDR + (i * DEVICE_ENTRY_SIZE);
-        for (int j = 0; j < 16; j++) {
-            EEPROM.writeByte(addr + j, knownDevices[i].irk[j]);
-        }
-        for (int j = 0; j < 16; j++) {
-            EEPROM.writeByte(addr + 16 + j, knownDevices[i].name[j]);
-        }
-    }
-    
-    EEPROM.commit();
-    Serial.printf("✅ %d devices saved to EEPROM!\n", numKnownDevices);
+void sendUnlockPulse() {
+    Serial.println("🔓 UNLOCK pulse sent to Wuling Confero BCM (K15D Pin 18)");
+    digitalWrite(UNLOCK_PIN, LOW);
+    delay(RELAY_PULSE_MS);
+    digitalWrite(UNLOCK_PIN, HIGH);
 }
 
-bool loadDevicesFromEEPROM() {
-    Serial.println("📖 Loading devices from EEPROM...");
-    
-    uint32_t magic = EEPROM.readULong(MAGIC_BYTES_ADDR);
-    if (magic != MAGIC_VALUE) {
-        Serial.println("❌ No valid device data found in EEPROM");
+String formatTimestamp() {
+    unsigned long s = millis() / 1000;
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%02lu:%02lu", (s / 60) % 60, s % 60);
+    return String(buf);
+}
+
+// ============================================================================
+// Bluetooth RPA Cryptographic Verification (AES-128)
+// ============================================================================
+bool verifyRPAWithKey(const uint8_t addr[6], const uint8_t aesKey[16]) {
+    uint8_t input[16] = {0};
+    input[13] = addr[0];
+    input[14] = addr[1];
+    input[15] = addr[2];
+
+    uint8_t aesOut[16];
+    mbedtls_aes_context ctx;
+    mbedtls_aes_init(&ctx);
+    mbedtls_aes_setkey_enc(&ctx, aesKey, 128);
+    mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, input, aesOut);
+    mbedtls_aes_free(&ctx);
+
+    return (aesOut[13] == addr[3] &&
+            aesOut[14] == addr[4] &&
+            aesOut[15] == addr[5]);
+}
+
+bool verifyRPA(const uint8_t addr[6], const uint8_t irk[16]) {
+    if ((addr[0] & 0xC0) != 0x40) {
         return false;
     }
-    
-    numKnownDevices = EEPROM.readInt(DEVICE_COUNT_ADDR);
-    if (numKnownDevices < 0 || numKnownDevices > MAX_DEVICES) {
-        Serial.println("❌ Invalid device count in EEPROM");
-        numKnownDevices = 0;
-        return false;
+
+    uint8_t reversedIrk[16];
+    for (int i = 0; i < 16; i++) {
+        reversedIrk[i] = irk[15 - i];
     }
-    
-    for (int i = 0; i < numKnownDevices; i++) {
-        int addr = DEVICES_START_ADDR + (i * DEVICE_ENTRY_SIZE);
-        for (int j = 0; j < 16; j++) {
-            knownDevices[i].irk[j] = EEPROM.readByte(addr + j);
-        }
-        for (int j = 0; j < 16; j++) {
-            knownDevices[i].name[j] = EEPROM.readByte(addr + 16 + j);
-        }
-        knownDevices[i].name[15] = '\0'; // Ensure null termination
-    }
-    
-    Serial.printf("✅ %d devices loaded from EEPROM:\n", numKnownDevices);
-    for (int i = 0; i < numKnownDevices; i++) {
-        Serial.printf("  %d: %s - ", i + 1, knownDevices[i].name);
-        for (int j = 0; j < 16; j++) {
-            if (knownDevices[i].irk[j] < 16) Serial.print("0");
-            Serial.print(knownDevices[i].irk[j], HEX);
-        }
-        Serial.println();
-    }
-    
-    return true;
+
+    return verifyRPAWithKey(addr, reversedIrk) || verifyRPAWithKey(addr, irk);
 }
 
-void addDevice(uint8_t* irk, const char* name) {
-    if (numKnownDevices >= MAX_DEVICES) {
-        Serial.println("❌ Maximum device limit reached!");
-        blinkPattern(2, 1000, 500); // 2x long blink = storage full
+// ============================================================================
+// Real-Time Unified BLE Scan Callback (IRK Phones + Static-MAC Watches)
+// ============================================================================
+class KeylessScanCallbacks : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice advertisedDevice) override {
+        esp_bd_addr_t* nativeAddr = advertisedDevice.getAddress().getNative();
+        int rssi = advertisedDevice.getRSSI();
+
+        // 1. Check bonded IRK devices (up to 30 phones / Wear OS / Apple Watches)
+        for (int d = 0; d < MAX_IRK_DEVICES; d++) {
+            if (!storage.irkDevices[d].used) continue;
+            if (verifyRPA(*nativeAddr, storage.irkDevices[d].irk)) {
+                if (rssi > scanBestRssi) {
+                    scanBestRssi = rssi;
+                    strncpy(scanMatchedName, storage.irkDevices[d].name, sizeof(scanMatchedName) - 1);
+                    scanMatchedName[sizeof(scanMatchedName) - 1] = '\0';
+                }
+                return;
+            }
+        }
+
+        // 2. Check enabled Static-MAC passive keys (up to 30 watches / beacons)
+        for (int k = 0; k < MAX_PASSIVE_KEYS; k++) {
+            if (!storage.passiveKeys[k].used || !storage.passiveKeys[k].enabled) continue;
+            if (memcmp(*nativeAddr, storage.passiveKeys[k].mac, 6) == 0) {
+                if (rssi > scanBestRssi) {
+                    scanBestRssi = rssi;
+                    strncpy(scanMatchedName, storage.passiveKeys[k].name, sizeof(scanMatchedName) - 1);
+                    scanMatchedName[sizeof(scanMatchedName) - 1] = '\0';
+                }
+                return;
+            }
+        }
+    }
+};
+
+KeylessScanCallbacks scanCallbacks;
+
+// ============================================================================
+// Nearby Static-MAC Snapshot Scanner (For /keys Dropdown)
+// ============================================================================
+class SnapshotScanCallbacks : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice dev) override {
+        esp_bd_addr_t* nativeAddr = dev.getAddress().getNative();
+        esp_ble_addr_type_t addrType = dev.getAddressType();
+
+        // Filter out rotating RPAs (random address with top 2 bits == 01)
+        if (addrType == BLE_ADDR_TYPE_RANDOM && ((*nativeAddr)[0] & 0xC0) == 0x40) {
+            return;
+        }
+
+        String macStr = StorageManager::macToString(*nativeAddr);
+        int rssi = dev.getRSSI();
+        String devName = dev.haveName() ? String(dev.getName().c_str()) : String("BLE Device");
+        devName.trim();
+        if (devName.length() == 0) devName = "BLE Device";
+
+        // Update if MAC already seen in this scan
+        for (int i = 0; i < wifiManager.nearbyBleCount; i++) {
+            if (macStr == wifiManager.nearbyBle[i].mac) {
+                if (rssi > wifiManager.nearbyBle[i].rssi) {
+                    wifiManager.nearbyBle[i].rssi = rssi;
+                }
+                if (devName != "BLE Device" && String(wifiManager.nearbyBle[i].name) == "BLE Device") {
+                    strncpy(wifiManager.nearbyBle[i].name, devName.c_str(), 27);
+                    wifiManager.nearbyBle[i].name[27] = '\0';
+                }
+                return;
+            }
+        }
+
+        if (wifiManager.nearbyBleCount < MAX_NEARBY_BLE) {
+            int idx = wifiManager.nearbyBleCount++;
+            strncpy(wifiManager.nearbyBle[idx].name, devName.c_str(), 27);
+            wifiManager.nearbyBle[idx].name[27] = '\0';
+            strncpy(wifiManager.nearbyBle[idx].mac, macStr.c_str(), 17);
+            wifiManager.nearbyBle[idx].mac[17] = '\0';
+            wifiManager.nearbyBle[idx].rssi = rssi;
+        }
+    }
+};
+
+void captureNearbyBleSnapshot(uint32_t seconds) {
+    Serial.printf("📡 Capturing %lus nearby static-MAC BLE snapshot...\n", (unsigned long)seconds);
+    wifiManager.nearbyBleCount = 0;
+
+    BLEScan* snapScan = BLEDevice::getScan();
+    SnapshotScanCallbacks snapCb;
+    snapScan->setAdvertisedDeviceCallbacks(&snapCb, true);
+    snapScan->setActiveScan(true);
+    snapScan->setInterval(100);
+    snapScan->setWindow(99);
+    snapScan->start(seconds, false);
+    snapScan->clearResults();
+
+    // Sort strongest RSSI first
+    for (int i = 0; i < wifiManager.nearbyBleCount - 1; i++) {
+        for (int j = i + 1; j < wifiManager.nearbyBleCount; j++) {
+            if (wifiManager.nearbyBle[j].rssi > wifiManager.nearbyBle[i].rssi) {
+                NearbyBleEntry tmp = wifiManager.nearbyBle[i];
+                wifiManager.nearbyBle[i] = wifiManager.nearbyBle[j];
+                wifiManager.nearbyBle[j] = tmp;
+            }
+        }
+    }
+    Serial.printf("📋 Found %d nearby static-MAC BLE device(s)\n", wifiManager.nearbyBleCount);
+}
+
+// ============================================================================
+// BLE Server & PIN-Less "Just Works" Pairing Callbacks
+// ============================================================================
+class PairingServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) override {
+        Serial.println("📱 Device connected -> requesting Just Works bonding...");
+        esp_ble_set_encryption(param->connect.remote_bda, ESP_BLE_SEC_ENCRYPT);
+    }
+    void onDisconnect(BLEServer* pServer) override {
+        Serial.println("📴 Device disconnected from GATT");
+        if (isPairingWindow) {
+            delay(200);
+            pServer->startAdvertising();
+        }
+    }
+};
+
+class PairingSecurityCallbacks : public BLESecurityCallbacks {
+    uint32_t onPassKeyRequest() override { return 0; }
+    void onPassKeyNotify(uint32_t pass_key) override {}
+    bool onConfirmPIN(uint32_t pass_key) override { return true; }
+    bool onSecurityRequest() override { return isPairingWindow; }
+    void onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) override {
+        if (cmpl.success) {
+            Serial.println("✅ BLE Just Works Bonding Complete! Extracting IRK...");
+            pendingBondSync = true;
+        } else {
+            Serial.printf("❌ BLE Bonding Failed (reason: 0x%x)\n", cmpl.fail_reason);
+        }
+    }
+};
+
+void extractBondedIRKs() {
+    delay(400);
+
+    int devNum = esp_ble_get_bond_device_num();
+    if (devNum <= 0) return;
+
+    esp_ble_bond_dev_t* devList = (esp_ble_bond_dev_t*)malloc(sizeof(esp_ble_bond_dev_t) * devNum);
+    if (!devList) return;
+
+    if (esp_ble_get_bond_device_list(&devNum, devList) == ESP_OK) {
+        bool addedNew = false;
+        bool matchedExisting = false;
+        for (int i = 0; i < devNum; i++) {
+            if (devList[i].bond_key.key_mask & ESP_BLE_ID_KEY_MASK) {
+                if (storage.addOrUpdateIrkDevice(devList[i].bond_key.pid_key.irk)) {
+                    addedNew = true;
+                    Serial.printf("💾 New IRK saved to NVS! Total bonded phones: %d/%d\n",
+                                  storage.irkCount, MAX_IRK_DEVICES);
+                } else {
+                    matchedExisting = true;
+                    Serial.println("ℹ️ Phone IRK already in NVS (or 30/30 slots full)");
+                }
+            }
+            // Immediately free Bluedroid's 15-slot bond table so up to 30+ users can pair sequentially
+            esp_ble_remove_bond_device(devList[i].bd_addr);
+            Serial.println("🧹 Freed Bluedroid bond slot after IRK extraction");
+        }
+        if (addedNew || matchedExisting) {
+            blinkLed(addedNew ? 3 : 2, 150);
+            isPairingWindow = false;
+            BLEDevice::getAdvertising()->stop();
+            Serial.println("🔵 Pairing complete -> starting proximity scan immediately");
+        }
+    }
+    free(devList);
+}
+
+void clearResidualBluedroidBonds() {
+    int devNum = esp_ble_get_bond_device_num();
+    if (devNum <= 0) return;
+
+    esp_ble_bond_dev_t* devList = (esp_ble_bond_dev_t*)malloc(sizeof(esp_ble_bond_dev_t) * devNum);
+    if (!devList) return;
+
+    if (esp_ble_get_bond_device_list(&devNum, devList) == ESP_OK) {
+        for (int i = 0; i < devNum; i++) {
+            esp_ble_remove_bond_device(devList[i].bd_addr);
+        }
+        Serial.printf("🧹 Cleared %d residual Bluedroid bond slot(s) (NVS holds %d IRKs)\n",
+                      devNum, storage.irkCount);
+    }
+    free(devList);
+}
+
+// ============================================================================
+// Mutually Exclusive BLE <-> Wi-Fi Radio State Machine
+// ============================================================================
+void startBleMode(bool enablePairing) {
+    wifiManager.stop();
+    isWifiMode = false;
+
+    BLEDevice::init("ESPKV7 Tracker");
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P6);
+    clearResidualBluedroidBonds();
+
+    int totalRegisteredKeys = storage.irkCount + storage.passiveCount;
+
+    if (enablePairing || totalRegisteredKeys == 0) {
+        isPairingWindow = true;
+        BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
+        BLEDevice::setSecurityCallbacks(new PairingSecurityCallbacks());
+
+        BLESecurity* pSecurity = new BLESecurity();
+        pSecurity->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
+        pSecurity->setCapability(ESP_IO_CAP_NONE);
+        pSecurity->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+        pSecurity->setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+
+        pBLEServer = BLEDevice::createServer();
+        pBLEServer->setCallbacks(new PairingServerCallbacks());
+
+        BLEService* pService = pBLEServer->createService(BLEUUID(FITNESS_SERVICE_UUID));
+        BLECharacteristic* pChar = pService->createCharacteristic(
+            BLEUUID(FITNESS_CHAR_UUID),
+            BLECharacteristic::PROPERTY_READ
+        );
+        pChar->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED);
+        uint8_t dummyHr[2] = {0x00, 72};
+        pChar->setValue(dummyHr, 2);
+        pService->start();
+
+        BLEAdvertising* pAdv = BLEDevice::getAdvertising();
+        pAdv->addServiceUUID(BLEUUID(FITNESS_SERVICE_UUID));
+        pAdv->setAppearance(FITNESS_APPEARANCE);
+        pAdv->setScanResponse(true);
+        pAdv->setMinPreferred(0x06);
+        pAdv->setMaxPreferred(0x12);
+        pAdv->start();
+        Serial.println("🔵 BLE Advertising OPEN for PIN-less Pairing (ESPKV7 Tracker)");
+    } else {
+        isPairingWindow = false;
+        Serial.println("🔵 BLE Keyless Scan Mode Started");
+    }
+
+    pBLEScan = BLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(&scanCallbacks, true);
+    pBLEScan->setActiveScan(false);
+    pBLEScan->setInterval(100);
+    pBLEScan->setWindow(99);
+}
+
+void enterWifiMode() {
+    Serial.println("🔄 Switching from BLE to Wi-Fi Dashboard Mode...");
+    if (pBLEScan != nullptr) {
+        pBLEScan->stop();
+        pBLEScan->clearResults();
+    }
+
+    // Grab a quick 2-second snapshot of nearby watches/beacons before shutting BLE down
+    captureNearbyBleSnapshot(2);
+
+    pBLEScan = nullptr;
+    BLEDevice::deinit(true);
+    pBLEServer = nullptr;
+
+    isWifiMode = true;
+    wifiManager.begin(&storage);
+}
+
+// ============================================================================
+// Exterior Button Handler (1-Second Hold Toggle)
+// ============================================================================
+void checkWifiToggleButton() {
+    static unsigned long pressStartMs = 0;
+    static bool toggleHandled = false;
+
+    if (digitalRead(WIFI_BUTTON_PIN) == LOW) {
+        if (pressStartMs == 0) {
+            pressStartMs = millis();
+            toggleHandled = false;
+        } else if (!toggleHandled && (millis() - pressStartMs >= BUTTON_HOLD_MS)) {
+            toggleHandled = true;
+            if (!isWifiMode) {
+                enterWifiMode();
+            } else {
+                startBleMode(false);
+            }
+        }
+    } else {
+        pressStartMs = 0;
+        toggleHandled = false;
+    }
+}
+
+// ============================================================================
+// Setup & Main Loop
+// ============================================================================
+void setup() {
+    digitalWrite(LOCK_PIN, HIGH);
+    digitalWrite(UNLOCK_PIN, HIGH);
+    pinMode(LOCK_PIN, OUTPUT);
+    pinMode(UNLOCK_PIN, OUTPUT);
+
+    pinMode(LED_PIN, OUTPUT);
+    setLed(false);
+
+    pinMode(WIFI_BUTTON_PIN, INPUT_PULLUP);
+
+    Serial.begin(115200);
+    delay(300);
+    Serial.println("\n=== ESPKV7 Wuling Confero BLE Keyless v1.2 (Fleet 30+30) Starting ===");
+
+    storage.begin();
+    Serial.printf("Loaded %d/%d IRK phone(s) and %d/%d passive key(s) from NVS\n",
+                  storage.irkCount, MAX_IRK_DEVICES,
+                  storage.passiveCount, MAX_PASSIVE_KEYS);
+
+    bootTimeMs = millis();
+    startBleMode(true);
+}
+
+void loop() {
+    checkWifiToggleButton();
+
+    // ------------------------------------------------------------------------
+    // Mode A: Wi-Fi Dashboard Mode (LED blinks every 500 ms, 3-min timeout)
+    // ------------------------------------------------------------------------
+    if (isWifiMode) {
+        static unsigned long lastBlinkMs = 0;
+        static bool blinkState = false;
+        if (millis() - lastBlinkMs >= 500) {
+            lastBlinkMs = millis();
+            blinkState = !blinkState;
+            setLed(blinkState);
+        }
+
+        wifiManager.handleClient();
+
+        // Timed 3-second radio swap when user clicks "Scan" on /keys
+        if (wifiManager.bleRescanRequested) {
+            wifiManager.bleRescanRequested = false;
+            delay(150);
+            wifiManager.suspendForBleScan();
+            BLEDevice::init("");
+            captureNearbyBleSnapshot(3);
+            BLEDevice::deinit(true);
+            wifiManager.resumeAfterBleScan();
+        }
+
+        if (wifiManager.rebootRequested) {
+            Serial.println("🔄 Rebooting to open 30s BLE pairing window...");
+            delay(350);
+            ESP.restart();
+        }
+
+        if (wifiManager.resumeBleRequested || wifiManager.isTimedOut()) {
+            Serial.println("🔵 Returning to BLE Keyless Mode...");
+            delay(250);
+            startBleMode(false);
+        }
         return;
     }
 
-    // Check if device already exists
-    for (int i = 0; i < numKnownDevices; i++) {
-        if (memcmp(knownDevices[i].irk, irk, 16) == 0) {
-            Serial.printf("⚠️ Device %s already known, skipping...\n", name);
+    // ------------------------------------------------------------------------
+    // Mode B: BLE Keyless Proximity Mode
+    // ------------------------------------------------------------------------
+    if (pendingBondSync) {
+        pendingBondSync = false;
+        extractBondedIRKs();
+    }
+
+    int totalKeys = storage.irkCount + storage.passiveCount;
+    if (isPairingWindow) {
+        if (totalKeys > 0 && (millis() - bootTimeMs >= PAIRING_WINDOW_MS)) {
+            isPairingWindow = false;
+            BLEDevice::getAdvertising()->stop();
+            Serial.println("🔒 30-second pairing window closed -> scanning started");
+        } else {
+            static unsigned long lastWaitLogMs = 0;
+            if (millis() - lastWaitLogMs >= 5000) {
+                lastWaitLogMs = millis();
+                if (totalKeys == 0) {
+                    Serial.println("⏳ Waiting for phone to pair or holding GPIO 9 to add watch keys...");
+                } else {
+                    unsigned long left = (PAIRING_WINDOW_MS - (millis() - bootTimeMs)) / 1000;
+                    Serial.printf("⏳ Pairing window open (%lus left before proximity scan starts)...\n", left);
+                }
+            }
+            delay(50);
             return;
         }
     }
 
-    // Add new device to legacy array
-    memcpy(knownDevices[numKnownDevices].irk, irk, 16);
-    strncpy(knownDevices[numKnownDevices].name, name, 15);
-    knownDevices[numKnownDevices].name[15] = '\0';
-    numKnownDevices++;
+    // Run 1-second passive BLE scan across up to 30 IRK phones + 30 Static-MAC keys
+    scanBestRssi = -127;
+    scanMatchedName[0] = '\0';
+    pBLEScan->start(1, false);
+    pBLEScan->clearResults();
 
-    // Also save to NVS storage
-    storage.addDevice(irk, name);
+    int bestMatchedRssi = scanBestRssi;
+    bool foundKey = (scanMatchedName[0] != '\0');
 
-    Serial.printf("✅ Added device: %s\n", name);
-    saveDevicesToEEPROM();  // Keep EEPROM as backup
+    if (foundKey) {
+        setLed(true);
+        wifiManager.lastDeviceName = String(scanMatchedName);
+        wifiManager.lastRssi = bestMatchedRssi;
 
-    blinkPattern(3, 200, 200); // 3x short blink = device added
-}
+        Serial.printf("📡 %s | RSSI: %d dBm | Car: %s\n",
+                      scanMatchedName,
+                      bestMatchedRssi,
+                      isCarUnlocked ? "UNLOCKED" : "LOCKED");
 
-// ========================================
-// CRYPTO FUNCTIONS
-// ========================================
+        if (bestMatchedRssi >= storage.settings.unlockRssi) {
+            lastStrongSeenMs = millis();
+            consecutiveWeakScans = 0;
 
-void aes128_ecb_fast(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
-    mbedtls_aes_context ctx;
-    mbedtls_aes_init(&ctx);
-    mbedtls_aes_setkey_enc(&ctx, key, 128);
-    mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, in, out);
-    mbedtls_aes_free(&ctx);
-}
-
-int verifyRPA(const uint8_t* rpaAddress) {
-    if ((rpaAddress[0] & 0xC0) != 0x40) {
-        return -1; // Not a valid RPA
-    }
-    
-    uint8_t prand[3] = {rpaAddress[0], rpaAddress[1], rpaAddress[2]};
-    uint8_t rpaHash[3] = {rpaAddress[3], rpaAddress[4], rpaAddress[5]};
-    
-    uint8_t input[16] = {0};
-    input[13] = prand[0];
-    input[14] = prand[1];
-    input[15] = prand[2];
-    
-    for (int deviceIndex = 0; deviceIndex < numKnownDevices; deviceIndex++) {
-        uint8_t aesResult[16];
-        aes128_ecb_fast(knownDevices[deviceIndex].irk, input, aesResult);
-        
-        uint8_t reversedResult[16];
-        for (int i = 0; i < 16; i++) {
-            reversedResult[i] = aesResult[15 - i];
-        }
-        
-        uint8_t computedHash[3] = {reversedResult[0], reversedResult[1], reversedResult[2]};
-        
-        bool matches = (computedHash[0] == rpaHash[2] && 
-                       computedHash[1] == rpaHash[1] && 
-                       computedHash[2] == rpaHash[0]);
-        
-        if (matches) {
-            return deviceIndex;
-        }
-    }
-    
-    return -1;
-}
-
-// ========================================
-// KEYLESS SYSTEM FUNCTIONS
-// ========================================
-
-void activateKeyPower() {
-    if (!keyPowered) {
-        digitalWrite(KEY_POWER_PIN, HIGH);
-        keyPowered = true;
-        keyPowerTime = millis();
-        Serial.println("🔌 Key power activated");
-    }
-}
-
-void deactivateKeyPower() {
-    if (keyPowered) {
-        digitalWrite(KEY_POWER_PIN, LOW);
-        keyPowered = false;
-        Serial.println("🔌 Key power deactivated");
-    }
-}
-
-void triggerLock() {
-    digitalWrite(LOCK_BUTTON_PIN, HIGH);
-    delay(100);
-    digitalWrite(LOCK_BUTTON_PIN, LOW);
-    lockTriggered = true;
-    lockTriggerTime = millis();
-    Serial.println("🔒 Lock triggered");
-
-    // Log lock event
-    if (lastUnlockDevice >= 0 && lastUnlockDevice < numKnownDevices) {
-        auditLog.logEvent(lastUnlockDevice, ACTION_LOCK, -99);
-    }
-}
-
-void triggerUnlock() {
-    digitalWrite(UNLOCK_BUTTON_PIN, HIGH);
-    delay(100);
-    digitalWrite(UNLOCK_BUTTON_PIN, LOW);
-    unlockTriggered = true;
-    Serial.println("🔓 Unlock triggered");
-
-    // Log unlock event (device and RSSI set by scan callback)
-}
-
-void handleAllPhonesGone(const char* reason) {
-    anyPhoneNearby = false;
-    for (int i = 0; i < numKnownDevices; i++) {
-        deviceNearby[i] = false;
-        deviceHysteresis[i].weakSignalCount = 0;
-        deviceHysteresis[i].isWeak = false;
-    }
-    
-    setLED(false);
-    Serial.printf("📱 All phones gone (%s)\n", reason);
-    
-    if (!lockTriggered && !pendingLock) {
-        lockTriggerTime = millis() + LOCK_STABILIZATION_DELAY;
-        pendingLock = true;
-        unlockTriggered = true;
-        Serial.println("🔒 Lock scheduled");
-    }
-}
-
-// ========================================
-// BLE PAIRING CLASSES
-// ========================================
-
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-        deviceConnected = true;
-        Serial.println("=======================================");
-        Serial.println("=== DEVICE CONNECTED ===");
-        Serial.println("📱 iPhone connected for pairing!");
-        Serial.println("=======================================");
-    }
-
-    void onDisconnect(BLEServer* pServer) {
-        deviceConnected = false;
-        Serial.println("=== DEVICE DISCONNECTED ===");
-        delay(500);
-        if (currentMode == MODE_PAIRING) {
-            pServer->startAdvertising();
-            Serial.println("🔄 Restarting advertising...");
-        }
-    }
-};
-
-class MySecurity : public BLESecurityCallbacks {
-    uint32_t onPassKeyRequest() {
-        Serial.println("=== PASSKEY REQUEST ===");
-        Serial.println("📱 iPhone requesting passkey...");
-        return 123456;
-    }
-
-    void onPassKeyNotify(uint32_t pass_key) {
-        Serial.printf("=== PASSKEY NOTIFY: %d ===\n", pass_key);
-    }
-
-    bool onConfirmPIN(uint32_t pass_key) {
-        Serial.printf("=== CONFIRM PIN: %d ===\n", pass_key);
-        return (pass_key == 123456); // Only accept our fixed PIN
-    }
-
-    bool onSecurityRequest() {
-        Serial.println("=== SECURITY REQUEST ===");
-        return true;
-    }
-
-    void onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) {
-        Serial.println("=======================================");
-        Serial.println("=== AUTHENTICATION COMPLETE ===");
-        
-        if (cmpl.success) {
-            Serial.println("🎉 PAIRING SUCCESSFUL!");
-            
-            esp_bd_addr_t bda;
-            memcpy(bda, cmpl.bd_addr, 6);
-            
-            Serial.print("📱 iPhone Address: ");
-            for (int i = 0; i < 6; i++) {
-                if (bda[i] < 16) Serial.print("0");
-                Serial.print(bda[i], HEX);
-                if (i < 5) Serial.print(":");
+            if (!isCarUnlocked) {
+                sendUnlockPulse();
+                isCarUnlocked = true;
+                wifiManager.lastAction = "Unlock";
+                wifiManager.lastEventTime = formatTimestamp();
             }
-            Serial.println();
-            
-            // Extract IRK
-            int dev_num = esp_ble_get_bond_device_num();
-            if (dev_num > 0) {
-                esp_ble_bond_dev_t *bond_device_list = (esp_ble_bond_dev_t *)malloc(sizeof(esp_ble_bond_dev_t) * dev_num);
-                esp_ble_get_bond_device_list(&dev_num, bond_device_list);
-                
-                for (int i = 0; i < dev_num; i++) {
-                    bool isCurrentDevice = true;
-                    for (int j = 0; j < 6; j++) {
-                        if (bond_device_list[i].bd_addr[j] != bda[j]) {
-                            isCurrentDevice = false;
-                            break;
-                        }
-                    }
-                    
-                    if (isCurrentDevice) {
-                        // Create device name
-                        char deviceName[16];
-                        snprintf(deviceName, sizeof(deviceName), "Device_%02d", numKnownDevices + 1);
-                        
-                        // Fix IRK byte order - ESP32 BLE stack returns IRK in reverse order
-                        uint8_t correctedIRK[16];
-                        for (int k = 0; k < 16; k++) {
-                            correctedIRK[k] = bond_device_list[i].bond_key.pid_key.irk[15 - k];
-                        }
-                        
-                        Serial.println("🔍 Original IRK (as received):");
-                        for (int k = 0; k < 16; k++) {
-                            if (bond_device_list[i].bond_key.pid_key.irk[k] < 16) Serial.print("0");
-                            Serial.print(bond_device_list[i].bond_key.pid_key.irk[k], HEX);
-                        }
-                        Serial.println();
-                        
-                        Serial.println("🔄 Corrected IRK (byte-reversed):");
-                        for (int k = 0; k < 16; k++) {
-                            if (correctedIRK[k] < 16) Serial.print("0");
-                            Serial.print(correctedIRK[k], HEX);
-                        }
-                        Serial.println();
-                        
-                        // Add device with corrected IRK
-                        addDevice(correctedIRK, deviceName);
-                        
-                        Serial.println("🔑 IRK successfully extracted and saved!");
-                        Serial.println("🔄 Restarting ESP32 for clean BLE initialization...");
-                        delay(2000);
-                        ESP.restart(); // Clean restart for proper BLE mode switching
-                        break;
-                    }
-                }
-                free(bond_device_list);
-            }
+        } else if (bestMatchedRssi <= storage.settings.lockRssi) {
+            consecutiveWeakScans++;
         } else {
-            Serial.printf("❌ PAIRING FAILED! Reason: %d\n", cmpl.fail_reason);
-            blinkPattern(5, 100, 100); // Very fast blink = error
-        }
-        Serial.println("=======================================");
-    }
-};
-
-// ========================================
-// BLE KEYLESS SCAN CALLBACK
-// ========================================
-
-class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
-    void onResult(BLEAdvertisedDevice advertisedDevice) {
-        if (currentMode != MODE_KEYLESS) return;
-        
-        esp_bd_addr_t* addr = advertisedDevice.getAddress().getNative();
-        
-        if (((*addr)[0] & 0xC0) == 0x40) { // RPA check
-            int matchedDevice = verifyRPA((uint8_t*)(*addr));
-            if (matchedDevice >= 0) {
-                int rssi = advertisedDevice.getRSSI();
-                const char* deviceName = knownDevices[matchedDevice].name;
-                
-                // Check for unlock (more sensitive, longer range)
-                if (rssi > RSSI_UNLOCK_THRESHOLD) {
-                    lastSeenTime[matchedDevice] = millis();
-                    deviceHysteresis[matchedDevice].weakSignalCount = 0;
-                    deviceHysteresis[matchedDevice].isWeak = false;
-                    
-                    bool wasAnyPhoneNearby = anyPhoneNearby;
-                    deviceNearby[matchedDevice] = true;
-                    
-                    // Update overall status
-                    anyPhoneNearby = false;
-                    for (int i = 0; i < numKnownDevices; i++) {
-                        if (deviceNearby[i]) {
-                            anyPhoneNearby = true;
-                            break;
-                        }
-                    }
-                    
-                    // Removed frequent serial output to prevent TX buffer blocking WiFi
-
-                    // Immediate unlock on first strong signal
-                    if (!wasAnyPhoneNearby && anyPhoneNearby) {
-                        setLED(true);
-                        activateKeyPower();
-                        lockTriggered = false;
-                        unlockTriggered = false;
-                        pendingLock = false;
-                        lastUnlockDevice = matchedDevice;  // Track device for logging
-                        auditLog.logEvent(matchedDevice, ACTION_UNLOCK, rssi);  // Log unlock
-                        Serial.println("🔓 Welcome! Activating unlock sequence...");
-                    }
-                } else if (rssi <= RSSI_LOCK_THRESHOLD) {
-                    // Check for lock (less sensitive, shorter range)
-                    // Weak signal hysteresis
-                    if (millis() - deviceHysteresis[matchedDevice].lastWeakSignalTime > WEAK_SIGNAL_RESET_TIME) {
-                        deviceHysteresis[matchedDevice].weakSignalCount = 0;
-                    }
-                    deviceHysteresis[matchedDevice].lastWeakSignalTime = millis();
-                    
-                    if (++deviceHysteresis[matchedDevice].weakSignalCount >= WEAK_SIGNAL_THRESHOLD) {
-                        deviceHysteresis[matchedDevice].isWeak = true;
-                        deviceNearby[matchedDevice] = false;
-                        
-                        // Update overall status
-                        anyPhoneNearby = false;
-                        for (int i = 0; i < numKnownDevices; i++) {
-                            if (deviceNearby[i]) {
-                                anyPhoneNearby = true;
-                                break;
-                            }
-                        }
-                        
-                        // Removed: Serial output blocked WiFi when no monitor connected
-
-                        if (!anyPhoneNearby) {
-                            handleAllPhonesGone("weak signal hysteresis");
-                        }
-                    }
-                } else {
-                    // RSSI between -90 and -80: Maintain current state, update last seen time
-                    if (deviceNearby[matchedDevice]) {
-                        lastSeenTime[matchedDevice] = millis();
-                        // Removed: Serial output blocked WiFi when no monitor connected
-                    }
-                }
-            }
-        }
-    }
-};
-
-// ========================================
-// MODE SWITCHING FUNCTIONS
-// ========================================
-
-void startPairingMode() {
-    currentMode = MODE_PAIRING;
-    pairingStartTime = millis();
-    
-    Serial.println("🔵 Starting BLE pairing mode...");
-    
-    // Initialize BLE for pairing
-    BLEDevice::init("ESPKV7 Tracker");
-    BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
-    BLEDevice::setSecurityCallbacks(new MySecurity());
-    
-    // Create server
-    pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
-    
-    // Create Device Information Service
-    BLEService *pDeviceInfoService = pServer->createService(DEVICE_INFO_SERVICE_UUID);
-    BLECharacteristic *pManufacturerChar = pDeviceInfoService->createCharacteristic(
-        "2A29", BLECharacteristic::PROPERTY_READ
-    );
-    pManufacturerChar->setValue("ESPKV7 Tech");
-    
-    BLECharacteristic *pModelChar = pDeviceInfoService->createCharacteristic(
-        "2A24", BLECharacteristic::PROPERTY_READ
-    );
-    pModelChar->setValue("KeyTracker Pro");
-    
-    BLECharacteristic *pFirmwareChar = pDeviceInfoService->createCharacteristic(
-        "2A26", BLECharacteristic::PROPERTY_READ
-    );
-    pFirmwareChar->setValue("v7.0");
-    pDeviceInfoService->start();
-    
-    // Create Battery Service
-    BLEService *pBatteryService = pServer->createService(BATTERY_SERVICE_UUID);
-    BLECharacteristic *pBatteryChar = pBatteryService->createCharacteristic(
-        "2A19", BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
-    );
-    pBatteryChar->addDescriptor(new BLE2902());
-    uint8_t batteryLevel = 85; // Fake 85% battery
-    pBatteryChar->setValue(&batteryLevel, 1);
-    pBatteryService->start();
-    
-    // Create Heart Rate Service (main pairing service)
-    BLEService *pHeartRateService = pServer->createService(HEART_RATE_SERVICE_UUID);
-    BLECharacteristic *pHeartRateChar = pHeartRateService->createCharacteristic(
-        CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
-    );
-    pHeartRateChar->addDescriptor(new BLE2902());
-    uint8_t heartRateData[2] = {0x00, 75}; // Fake 75 BPM
-    pHeartRateChar->setValue(heartRateData, 2);
-    pHeartRateService->start();
-    
-    // Configure security
-    esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_BOND;
-    esp_ble_io_cap_t iocap = ESP_IO_CAP_KBDISP;
-    uint8_t key_size = 16;
-    uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
-    uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
-    
-    esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(uint8_t));
-    esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(uint8_t));
-    esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(uint8_t));
-    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(uint8_t));
-    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(uint8_t));
-    
-    // Start advertising as fitness tracker
-    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-    
-    // Configure for iPhone fitness device compatibility
-    pAdvertising->addServiceUUID(HEART_RATE_SERVICE_UUID);  // Heart rate service first
-    pAdvertising->addServiceUUID(BATTERY_SERVICE_UUID);     // Battery service
-    pAdvertising->addServiceUUID(DEVICE_INFO_SERVICE_UUID); // Device info service
-    pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x20);   // 20ms min interval
-    pAdvertising->setMaxPreferred(0x40);   // 40ms max interval
-    
-    // Set advertisement data with fitness tracker appearance
-    BLEAdvertisementData advertisementData;
-    advertisementData.setName("ESPKV7 Tracker");
-    advertisementData.setAppearance(0x0340); // Generic: Heart Rate Sensor
-    advertisementData.setCompleteServices(BLEUUID(HEART_RATE_SERVICE_UUID));
-    advertisementData.setFlags(0x06); // General discoverable mode + BR/EDR not supported
-    
-    pAdvertising->setAdvertisementData(advertisementData);
-    
-    // Set scan response data with additional services
-    BLEAdvertisementData scanResponseData;
-    scanResponseData.setName("ESPKV7 Tracker");
-    scanResponseData.setPartialServices(BLEUUID(BATTERY_SERVICE_UUID));
-    pAdvertising->setScanResponseData(scanResponseData);
-    
-    BLEDevice::startAdvertising();
-    
-    Serial.println("🚀 ESPKV7 Tracker advertising started!");
-    Serial.println("📱 Go to iPhone Settings > Bluetooth and look for 'ESPKV7 Tracker' as fitness device");
-    if (numKnownDevices > 0) {
-        Serial.printf("⏱️ 30s window to add more devices (or automatic keyless mode after timeout)\n");
-    } else {
-        Serial.printf("⏱️ Pairing window: %d seconds\n", PAIRING_TIMEOUT_MS / 1000);
-    }
-}
-
-void startKeylessMode() {
-    currentMode = MODE_KEYLESS;
-    
-    Serial.println("🔐 Starting keyless mode...");
-    
-    // Stop advertising if running
-    if (pServer) {
-        pServer->getAdvertising()->stop();
-    }
-    
-    // Complete BLE shutdown and restart for clean scanner mode
-    Serial.println("🔄 Reinitializing BLE stack for scanning...");
-    BLEDevice::deinit(true);
-    delay(2000);  // Extended delay for complete BLE stack cleanup
-    
-    // Restart BLE in scanner mode
-    BLEDevice::init("");
-    delay(500);   // Allow BLE stack to initialize
-    
-    // Setup scanner with robust error handling
-    pBLEScan = BLEDevice::getScan();
-    if (pBLEScan) {
-        Serial.println("📡 Setting up BLE scanner...");
-        pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-        pBLEScan->setActiveScan(false);  // Passive scanning is more reliable
-        
-        // Wait for BLE to be ready, then set parameters
-        delay(1000);
-        
-        // Use very conservative scan parameters to avoid errors
-        pBLEScan->setInterval(1600);  // 1000ms intervals
-        pBLEScan->setWindow(800);     // 500ms windows
-        
-        Serial.println("📡 BLE scanner ready - parameters set successfully");
-    } else {
-        Serial.println("❌ Failed to create BLE scanner");
-    }
-    
-    // Initialize hysteresis
-    for (int i = 0; i < numKnownDevices; i++) {
-        deviceHysteresis[i].weakSignalCount = 0;
-        deviceHysteresis[i].lastWeakSignalTime = 0;
-        deviceHysteresis[i].isWeak = false;
-        deviceNearby[i] = false;
-        lastSeenTime[i] = 0;
-    }
-    
-    Serial.println("✅ Keyless system ready - monitoring for known devices");
-    setLED(true); // Solid LED = keyless mode active
-    delay(2000);
-    setLED(false);
-}
-
-// ========================================
-// MAIN SETUP
-// ========================================
-
-void setup() {
-    Serial.begin(115200);
-    delay(1000);
-
-    Serial.println("=======================================");
-    Serial.println("🔵 ESP32 Dynamic Keyless System v7.2");
-    Serial.println("    + Web Dashboard");
-    Serial.println("=======================================");
-
-    // Initialize EEPROM (for migration)
-    EEPROM.begin(EEPROM_SIZE);
-
-    // Initialize NVS Storage
-    if (!storage.begin()) {
-        Serial.println("Failed to initialize NVS storage!");
-    }
-
-    // Load settings from NVS and apply to global variables
-    storage.loadSettings();
-    RSSI_UNLOCK_THRESHOLD = storage.settings.rssiUnlockThreshold;
-    RSSI_LOCK_THRESHOLD = storage.settings.rssiLockThreshold;
-    PROXIMITY_TIMEOUT = storage.settings.proximityTimeout * 1000UL;  // Convert to ms
-    WEAK_SIGNAL_THRESHOLD = storage.settings.weakSignalThreshold;
-
-    // Initialize pins
-    pinMode(LED_PIN, OUTPUT);
-    pinMode(KEY_POWER_PIN, OUTPUT);
-    pinMode(LOCK_BUTTON_PIN, OUTPUT);
-    pinMode(UNLOCK_BUTTON_PIN, OUTPUT);
-
-    setLED(false);
-    digitalWrite(KEY_POWER_PIN, LOW);
-    digitalWrite(LOCK_BUTTON_PIN, LOW);
-    digitalWrite(UNLOCK_BUTTON_PIN, LOW);
-
-    // Initialize watchdog
-    esp_task_wdt_init(30, true);
-    esp_task_wdt_add(NULL);
-    Serial.println("🐕 Watchdog enabled (30s timeout)");
-
-    // Check reset reason to avoid endless restart loop
-    esp_reset_reason_t resetReason = esp_reset_reason();
-    Serial.printf("🔍 Reset reason: %d\n", resetReason);
-
-    // Initialize Audit Log
-    auditLog.begin(&storage);
-
-    // Initialize WiFi Manager
-    wifiManager.begin(&auditLog);
-    wifiManager.connect();
-
-    // Load existing devices from NVS first
-    bool hasNvsDevices = storage.loadDevices();
-
-    // Migrate from EEPROM if NVS is empty but EEPROM has data
-    bool hasDevices = false;
-    if (!hasNvsDevices) {
-        hasDevices = loadDevicesFromEEPROM();
-        if (hasDevices && numKnownDevices > 0) {
-            Serial.println("Migrating devices from EEPROM to NVS...");
-            for (int i = 0; i < numKnownDevices; i++) {
-                storage.addDevice(knownDevices[i].irk, knownDevices[i].name);
-            }
-            Serial.printf("Migrated %d devices to NVS\n", numKnownDevices);
+            lastStrongSeenMs = millis();
+            consecutiveWeakScans = 0;
         }
     } else {
-        // Sync NVS devices to legacy array for compatibility
-        hasDevices = true;
-        numKnownDevices = storage.deviceCount;
-        for (int i = 0; i < numKnownDevices; i++) {
-            memcpy(knownDevices[i].irk, storage.devices[i].irk, 16);
-            strncpy(knownDevices[i].name, storage.devices[i].name, 15);
-            knownDevices[i].name[15] = '\0';
+        setLed(false);
+        consecutiveWeakScans++;
+        if (isCarUnlocked) {
+            Serial.printf("📡 No signal | Weak count: %d/%d\n",
+                          consecutiveWeakScans,
+                          storage.settings.weakSignalCount);
         }
-        Serial.printf("Loaded %d devices from NVS\n", numKnownDevices);
-    }
-    
-    if (hasDevices && numKnownDevices > 0) {
-        Serial.printf("✅ Found %d known devices\n", numKnownDevices);
-        for (int i = 0; i < numKnownDevices; i++) {
-            Serial.printf("  %d: %s\n", i + 1, knownDevices[i].name);
-        }
-        
-        // If this is a software reset (from our auto-restart), go directly to keyless mode
-        if (resetReason == ESP_RST_SW) {
-            Serial.println("🔐 Software reset detected - starting keyless mode directly...");
-            startKeylessMode();
-        } else {
-            Serial.println("🔄 Power-on boot - starting 30s pairing window to add more devices...");
-            startPairingMode();
-        }
-    } else {
-        Serial.println("❌ No known devices found");
-        Serial.println("🔄 Starting pairing mode - connect your iPhone now!");
-        startPairingMode();
     }
 
-    // Start Web Dashboard Server
-    dashboardServer.begin(&storage, &auditLog, &wifiManager);
-    Serial.println("🌐 Web Dashboard ready");
-}
-
-// ========================================
-// MAIN LOOP
-// ========================================
-
-void loop() {
-    esp_task_wdt_reset();
-
-    // Update WiFi and Web Server
-    wifiManager.update();
-    dashboardServer.handleClient();
-
-    if (currentMode == MODE_PAIRING) {
-        // Check pairing timeout - but NOT in AP mode (WiFi setup)
-        if (millis() - pairingStartTime >= PAIRING_TIMEOUT_MS) {
-            Serial.printf("⏱️ Timeout reached. AP Mode: %s\n", wifiManager.isAPMode() ? "YES" : "NO");
-            if (wifiManager.isAPMode()) {
-                // Don't restart during WiFi setup - just reset timer silently
-                pairingStartTime = millis();
-            } else if (numKnownDevices > 0) {
-                Serial.println("⏰ Pairing timeout - restarting ESP32 for clean keyless mode");
-                delay(2000);
-                ESP.restart();
-            } else {
-                Serial.println("⏰ Pairing timeout - no devices paired, restarting pairing...");
-                pairingStartTime = millis();
-            }
-        }
-        
-        // LED blink pattern for pairing mode
-        if (deviceConnected) {
-            blinkLED(200); // Fast blink when connected
-        } else {
-            blinkLED(1000); // Slow blink when waiting
-        }
-        
-    } else { // MODE_KEYLESS
-        // BLE scan for known devices with error handling
-        esp_task_wdt_reset();
-        // Removed frequent serial output to prevent TX buffer blocking WiFi
-
-        BLEScanResults foundDevices;
-        try {
-            foundDevices = pBLEScan->start(SCAN_TIME, false);
-            esp_task_wdt_reset();
-        } catch (...) {
-            Serial.println("⚠️ BLE scan failed, reinitializing scanner...");
-            esp_task_wdt_reset();
-            
-            // Reinitialize scanner on error
-            pBLEScan = BLEDevice::getScan();
-            if (pBLEScan) {
-                pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-                pBLEScan->setActiveScan(false);
-                pBLEScan->setInterval(1600);
-                pBLEScan->setWindow(800);
-                Serial.println("📡 Scanner reinitialized");
-            }
-            foundDevices = BLEScanResults(); // Empty result
-        }
-        
-        // Reset weak signal counters if timeout
-        for (int i = 0; i < numKnownDevices; i++) {
-            if (deviceHysteresis[i].weakSignalCount > 0 && 
-                (millis() - deviceHysteresis[i].lastWeakSignalTime > WEAK_SIGNAL_RESET_TIME)) {
-                deviceHysteresis[i].weakSignalCount = 0;
-                deviceHysteresis[i].isWeak = false;
-            }
-        }
-        
-        // Check device timeouts
-        for (int i = 0; i < numKnownDevices; i++) {
-            if (deviceNearby[i] && (millis() - lastSeenTime[i] > PROXIMITY_TIMEOUT)) {
-                deviceNearby[i] = false;
-                Serial.printf("📱 %s timeout\n", knownDevices[i].name);
-                
-                // Update overall status
-                anyPhoneNearby = false;
-                for (int j = 0; j < numKnownDevices; j++) {
-                    if (deviceNearby[j]) {
-                        anyPhoneNearby = true;
-                        break;
-                    }
-                }
-                
-                if (!anyPhoneNearby) {
-                    handleAllPhonesGone("device timeout");
-                }
-            }
-        }
-        
-        // Execute pending lock
-        if (pendingLock && millis() >= lockTriggerTime) {
-            triggerLock();
-            pendingLock = false;
-        }
-        
-        // Trigger unlock after delay
-        if (anyPhoneNearby && keyPowered && !unlockTriggered && 
-            (millis() - keyPowerTime >= UNLOCK_DELAY)) {
-            triggerUnlock();
-        }
-        
-        // Turn off key power after lock
-        if (lockTriggered && (millis() - lockTriggerTime >= POWER_OFF_DELAY)) {
-            deactivateKeyPower();
-            lockTriggered = false;
-        }
-        
-        // LED status: ON when phones nearby, OFF when not
-        setLED(anyPhoneNearby);
-        
-        pBLEScan->clearResults();
-        delay(500);
+    unsigned long timeoutMs = (unsigned long)storage.settings.lockTimeoutSec * 1000UL;
+    if (isCarUnlocked &&
+        consecutiveWeakScans >= storage.settings.weakSignalCount &&
+        (millis() - lastStrongSeenMs >= timeoutMs)) {
+        sendLockPulse();
+        isCarUnlocked = false;
+        consecutiveWeakScans = 0;
+        wifiManager.lastAction = "Lock";
+        wifiManager.lastEventTime = formatTimestamp();
     }
 }
