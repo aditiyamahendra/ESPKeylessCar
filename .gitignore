@@ -41,3 +41,9 @@ secrets.h
 # Documentation build
 docs/_build/
 docs/.doctrees/
+# Secrets (never commit)
+src/secrets.h
+
+# Local-only files
+.security-audit/
+*.patch
