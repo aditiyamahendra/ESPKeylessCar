@@ -203,59 +203,93 @@ KeylessScanCallbacks scanCallbacks;
 // ============================================================================
 // Nearby Static-MAC Snapshot Scanner (For /keys Dropdown)
 // ============================================================================
-class SnapshotScanCallbacks : public BLEAdvertisedDeviceCallbacks {
-    void onResult(BLEAdvertisedDevice dev) override {
-        esp_bd_addr_t* nativeAddr = dev.getAddress().getNative();
-        esp_ble_addr_type_t addrType = dev.getAddressType();
+static void snapshotGapCallback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
+    if (event != ESP_GAP_BLE_SCAN_RESULT_EVT) return;
+    if (param->scan_rst.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) return;
 
-        // Filter out rotating RPAs (random address with top 2 bits == 01)
-        if (addrType == BLE_ADDR_TYPE_RANDOM && ((*nativeAddr)[0] & 0xC0) == 0x40) {
-            return;
-        }
+    uint8_t* bda = param->scan_rst.bda;
+    esp_ble_addr_type_t addrType = param->scan_rst.ble_addr_type;
 
-        String macStr = StorageManager::macToString(*nativeAddr);
-        int rssi = dev.getRSSI();
-        String devName = dev.haveName() ? String(dev.getName().c_str()) : String("BLE Device");
+    // Filter out rotating RPAs (random address with top 2 bits == 01)
+    if (addrType == BLE_ADDR_TYPE_RANDOM && (bda[0] & 0xC0) == 0x40) {
+        return;
+    }
+
+    String macStr = StorageManager::macToString(bda);
+    int rssi = param->scan_rst.rssi;
+
+    uint8_t nameLen = 0;
+    uint8_t* advName = esp_ble_resolve_adv_data(param->scan_rst.ble_adv, ESP_BLE_AD_TYPE_NAME_CMPL, &nameLen);
+    if (!advName || nameLen == 0) {
+        advName = esp_ble_resolve_adv_data(param->scan_rst.ble_adv, ESP_BLE_AD_TYPE_NAME_SHORT, &nameLen);
+    }
+
+    String devName = "BLE Device";
+    if (advName && nameLen > 0) {
+        char nameBuf[28];
+        size_t copyLen = nameLen < 27 ? nameLen : 27;
+        memcpy(nameBuf, advName, copyLen);
+        nameBuf[copyLen] = '\0';
+        devName = String(nameBuf);
         devName.trim();
         if (devName.length() == 0) devName = "BLE Device";
+    }
 
-        // Update if MAC already seen in this scan
-        for (int i = 0; i < wifiManager.nearbyBleCount; i++) {
-            if (macStr == wifiManager.nearbyBle[i].mac) {
-                if (rssi > wifiManager.nearbyBle[i].rssi) {
-                    wifiManager.nearbyBle[i].rssi = rssi;
-                }
-                if (devName != "BLE Device" && String(wifiManager.nearbyBle[i].name) == "BLE Device") {
-                    strncpy(wifiManager.nearbyBle[i].name, devName.c_str(), 27);
-                    wifiManager.nearbyBle[i].name[27] = '\0';
-                }
-                return;
+    // Update if MAC already seen in this scan
+    for (int i = 0; i < wifiManager.nearbyBleCount; i++) {
+        if (macStr == wifiManager.nearbyBle[i].mac) {
+            if (rssi > wifiManager.nearbyBle[i].rssi) {
+                wifiManager.nearbyBle[i].rssi = rssi;
             }
-        }
-
-        if (wifiManager.nearbyBleCount < MAX_NEARBY_BLE) {
-            int idx = wifiManager.nearbyBleCount++;
-            strncpy(wifiManager.nearbyBle[idx].name, devName.c_str(), 27);
-            wifiManager.nearbyBle[idx].name[27] = '\0';
-            strncpy(wifiManager.nearbyBle[idx].mac, macStr.c_str(), 17);
-            wifiManager.nearbyBle[idx].mac[17] = '\0';
-            wifiManager.nearbyBle[idx].rssi = rssi;
+            if (devName != "BLE Device" && String(wifiManager.nearbyBle[i].name) == "BLE Device") {
+                strncpy(wifiManager.nearbyBle[i].name, devName.c_str(), 27);
+                wifiManager.nearbyBle[i].name[27] = '\0';
+            }
+            return;
         }
     }
-};
+
+    if (wifiManager.nearbyBleCount < MAX_NEARBY_BLE) {
+        int idx = wifiManager.nearbyBleCount++;
+        strncpy(wifiManager.nearbyBle[idx].name, devName.c_str(), 27);
+        wifiManager.nearbyBle[idx].name[27] = '\0';
+        strncpy(wifiManager.nearbyBle[idx].mac, macStr.c_str(), 17);
+        wifiManager.nearbyBle[idx].mac[17] = '\0';
+        wifiManager.nearbyBle[idx].rssi = rssi;
+    }
+}
 
 void captureNearbyBleSnapshot(uint32_t seconds) {
     Serial.printf("📡 Capturing %lus nearby static-MAC BLE snapshot...\n", (unsigned long)seconds);
     wifiManager.nearbyBleCount = 0;
 
-    BLEScan* snapScan = BLEDevice::getScan();
-    SnapshotScanCallbacks snapCb;
-    snapScan->setAdvertisedDeviceCallbacks(&snapCb, true);
-    snapScan->setActiveScan(true);
-    snapScan->setInterval(100);
-    snapScan->setWindow(99);
-    snapScan->start(seconds, false);
-    snapScan->clearResults();
+    if (!BLEDevice::getInitialized()) {
+        BLEDevice::init("");
+    }
+
+    esp_ble_scan_params_t scanParams = {};
+    scanParams.scan_type = BLE_SCAN_TYPE_ACTIVE;
+    scanParams.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+    scanParams.scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL;
+    // 0.625 ms units: 320 * 0.625 = 200 ms interval, 64 * 0.625 = 40 ms window (20% duty cycle)
+    scanParams.scan_interval = 320;
+    scanParams.scan_window = 64;
+    scanParams.scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE;
+
+    esp_ble_gap_register_callback(snapshotGapCallback);
+    esp_ble_gap_set_scan_params(&scanParams);
+    delay(30);
+    esp_ble_gap_start_scanning(seconds);
+
+    unsigned long scanStart = millis();
+    while (millis() - scanStart < (unsigned long)seconds * 1000UL) {
+        if (isWifiMode) {
+            wifiManager.server.handleClient();
+        }
+        esp_task_wdt_reset();
+        delay(25);
+    }
+    esp_ble_gap_stop_scanning();
 
     // Sort strongest RSSI first
     for (int i = 0; i < wifiManager.nearbyBleCount - 1; i++) {
@@ -433,20 +467,23 @@ void startBleMode(bool enablePairing) {
 
 void enterWifiMode() {
     Serial.println("🔄 Switching from BLE to Wi-Fi Dashboard Mode...");
+    if (isPairingWindow) {
+        isPairingWindow = false;
+        BLEDevice::getAdvertising()->stop();
+    }
     if (pBLEScan != nullptr) {
-        pBLEScan->stop();
+    //    pBLEScan->stop();
         pBLEScan->clearResults();
     }
 
-    // Grab a quick 2-second snapshot of nearby watches/beacons before shutting BLE down
+    // Grab a quick 2-second snapshot of nearby watches/beacons before starting Wi-Fi
     captureNearbyBleSnapshot(2);
 
     pBLEScan = nullptr;
-    BLEDevice::deinit(false);   // false: keep BT memory so BLEDevice::init() can be called again
     pBLEServer = nullptr;
 
     esp_task_wdt_reset();
-    setCpuFrequencyMhz(CPU_MHZ_WIFI_MODE);   // BLE is off; give Wi-Fi/web server full speed
+    setCpuFrequencyMhz(CPU_MHZ_WIFI_MODE);   // Give Wi-Fi/web server full speed
     isWifiMode = true;
     wifiManager.begin(&storage);
     esp_task_wdt_reset();
@@ -601,11 +638,9 @@ void loop() {
         // Timed 3-second radio swap when user clicks "Scan" on /keys
         if (wifiManager.bleRescanRequested) {
             wifiManager.bleRescanRequested = false;
-            delay(150);
+            delay(30);
             wifiManager.suspendForBleScan();
-            BLEDevice::init("");
             captureNearbyBleSnapshot(3);
-            BLEDevice::deinit(false);
             wifiManager.resumeAfterBleScan();
         }
 

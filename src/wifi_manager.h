@@ -8,6 +8,7 @@
 #include "version.h"
 #include "ota_update.h"
 #include "esp_task_wdt.h"
+#include "esp_coexist.h"
 
 // Wi-Fi dashboard AP password lives in src/secrets.h (git-ignored).
 // Copy src/secrets.h.example to src/secrets.h and set your own password.
@@ -139,7 +140,7 @@ public:
     void startWifiRadios() {
         WiFi.persistent(false);
         WiFi.mode(WIFI_STA);
-        WiFi.disconnect(true);
+        WiFi.disconnect(false, false);
         delay(100);
 
         // Scan Wi-Fi BEFORE starting SoftAP so channel hopping never drops iOS clients
@@ -147,7 +148,7 @@ public:
 
         bool hasSavedWifi = (storage && strlen(storage->settings.wifiSsid) > 0);
         WiFi.mode(hasSavedWifi ? WIFI_AP_STA : WIFI_AP);
-        WiFi.setSleep(false);
+        WiFi.setSleep(true);
 
         IPAddress apIP(192, 168, 4, 1);
         WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
@@ -198,18 +199,20 @@ public:
     }
 
     void suspendForBleScan() {
-        server.stop();
-        dnsServer.stop();
-        MDNS.end();
-        WiFi.softAPdisconnect(true);
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
-        delay(150);
+        //server.stop();
+        //dnsServer.stop();
+        //MDNS.end();
+        //WiFi.softAPdisconnect(true);
+        //WiFi.disconnect(true);
+        //WiFi.mode(WIFI_OFF);
+        //delay(150);
+        esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
     }
 
     void resumeAfterBleScan() {
-        startWifiRadios();
-        server.begin();
+        //startWifiRadios();
+        //server.begin();
+        esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
         resetTimer();
     }
 
