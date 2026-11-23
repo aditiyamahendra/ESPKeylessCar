@@ -47,3 +47,10 @@ src/secrets.h
 # Local-only files
 .security-audit/
 *.patch
+
+# Beta 2.0: signing key, factory log, signed release files (never commit)
+tools/keys/
+tools/provisioning_log.csv
+*.espkv7
+src/secrets.h
+signed_firmware/
