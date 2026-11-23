@@ -7,6 +7,7 @@
 
 struct IrkDevice {
     bool used;
+    bool enabled;          // false = phone is paused (kept paired, ignored by the scanner)
     char name[24];
     char type[24];
     uint8_t irk[16];
@@ -87,6 +88,16 @@ public:
         return v;
     }
 
+    // --- Firmware update trial state (rollback guard) ---
+    bool getOtaPending()        { return prefs.getBool("ota_pend", false); }
+    void setOtaPending(bool v)  { prefs.putBool("ota_pend", v); }
+    int  getBootTries()         { return prefs.getInt("bt_try", 0); }
+    void setBootTries(int v)    { prefs.putInt("bt_try", v); }
+
+    // Erases every key and setting (phones, watches, thresholds, Wi-Fi client, flags).
+    // The caller must restart afterwards.
+    void factoryReset() { prefs.clear(); }
+
     void saveSettings() {
         prefs.putInt("u_rssi", settings.unlockRssi);
         prefs.putInt("l_rssi", settings.lockRssi);
@@ -111,6 +122,7 @@ public:
                 strncpy(irkDevices[i].type, t.c_str(), sizeof(irkDevices[i].type) - 1);
                 irkDevices[i].type[sizeof(irkDevices[i].type) - 1] = '\0';
                 prefs.getBytes((p + "k").c_str(), irkDevices[i].irk, 16);
+                irkDevices[i].enabled = prefs.getBool((p + "e").c_str(), true);   // missing = enabled
                 irkCount++;
             } else {
                 memset(&irkDevices[i], 0, sizeof(IrkDevice));
@@ -125,18 +137,24 @@ public:
             prefs.putString((p + "n").c_str(), irkDevices[idx].name);
             prefs.putString((p + "t").c_str(), irkDevices[idx].type);
             prefs.putBytes((p + "k").c_str(), irkDevices[idx].irk, 16);
+            prefs.putBool((p + "e").c_str(), irkDevices[idx].enabled);
         }
     }
 
     bool addOrUpdateIrkDevice(const uint8_t newIrk[16]) {
         for (int i = 0; i < MAX_IRK_DEVICES; i++) {
             if (irkDevices[i].used && memcmp(irkDevices[i].irk, newIrk, 16) == 0) {
+                if (!irkDevices[i].enabled) {      // re-pairing a paused phone resumes it
+                    irkDevices[i].enabled = true;
+                    saveIrkSlot(i);
+                }
                 return false; // Already saved
             }
         }
         for (int i = 0; i < MAX_IRK_DEVICES; i++) {
             if (!irkDevices[i].used) {
                 irkDevices[i].used = true;
+                irkDevices[i].enabled = true;
                 snprintf(irkDevices[i].name, sizeof(irkDevices[i].name), "Phone_%02d", i + 1);
                 strncpy(irkDevices[i].type, "RPA · IRK Verified", sizeof(irkDevices[i].type) - 1);
                 memcpy(irkDevices[i].irk, newIrk, 16);
@@ -156,6 +174,17 @@ public:
         strncpy(irkDevices[idx].name, clean.c_str(), sizeof(irkDevices[idx].name) - 1);
         irkDevices[idx].name[sizeof(irkDevices[idx].name) - 1] = '\0';
         saveIrkSlot(idx);
+    }
+
+    void setIrkEnabled(int idx, bool enabled) {
+        if (idx < 0 || idx >= MAX_IRK_DEVICES || !irkDevices[idx].used) return;
+        irkDevices[idx].enabled = enabled;
+        saveIrkSlot(idx);
+    }
+
+    void toggleIrkDevice(int idx) {
+        if (idx < 0 || idx >= MAX_IRK_DEVICES || !irkDevices[idx].used) return;
+        setIrkEnabled(idx, !irkDevices[idx].enabled);
     }
 
     void deleteIrkDevice(int idx) {

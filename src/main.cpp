@@ -6,6 +6,8 @@
 #include <BLEAdvertisedDevice.h>
 #include "esp_gap_ble_api.h"
 #include "esp_task_wdt.h"
+#include "esp_ota_ops.h"
+#include "version.h"
 #include "mbedtls/aes.h"
 #include "storage.h"
 #include "wifi_manager.h"
@@ -168,7 +170,7 @@ private:
 
         // 1. Check bonded IRK devices (up to 30 phones / Wear OS / Apple Watches)
         for (int d = 0; d < MAX_IRK_DEVICES; d++) {
-            if (!storage.irkDevices[d].used) continue;
+            if (!storage.irkDevices[d].used || !storage.irkDevices[d].enabled) continue;   // skip paused phones
             if (verifyRPA(*nativeAddr, storage.irkDevices[d].irk)) {
                 if (rssi >= ECO_WAKE_RSSI) lastActivityMs = millis();   // wake fast scan
                 if (rssi > scanBestRssi) {
@@ -330,7 +332,7 @@ void extractBondedIRKs() {
         if (addedNew || matchedExisting) {
             blinkLed(addedNew ? 3 : 2, 150);
             isPairingWindow = false;
-            lastActivityMs = millis();      // start the 2-minute fast-scan period from the moment pairing finishes
+            lastActivityMs = millis();   // full fast-scan period starts when pairing finishes
             BLEDevice::getAdvertising()->stop();
             Serial.println("🔵 Pairing complete -> starting proximity scan immediately");
         }
@@ -450,13 +452,58 @@ void enterWifiMode() {
     esp_task_wdt_reset();
 }
 
+// ============================================================================
+// Firmware update rollback guard
+// A freshly installed update is "on trial". If it restarts unexpectedly
+// OTA_MAX_UNSTABLE_BOOTS times before running OTA_CONFIRM_AFTER_MS, the previous
+// firmware slot is made the boot slot again. Intentional restarts do not count.
+// ============================================================================
+const unsigned long OTA_CONFIRM_AFTER_MS = 60000UL;
+const int OTA_MAX_UNSTABLE_BOOTS = 3;
+bool otaConfirmPending = false;
+
+static bool partitionHasImage(const esp_partition_t* p) {
+    if (p == NULL) return false;
+    uint8_t magic = 0;
+    if (esp_partition_read(p, 0, &magic, 1) != ESP_OK) return false;
+    return magic == 0xE9;   // ESP image header magic
+}
+
+void bootGuardOnBoot() {
+    if (!storage.getOtaPending()) return;
+    int tries = storage.getBootTries() + 1;
+    storage.setBootTries(tries);
+    otaConfirmPending = true;
+    Serial.printf("🧪 New firmware on trial: start %d of %d\n", tries, OTA_MAX_UNSTABLE_BOOTS);
+    if (tries >= OTA_MAX_UNSTABLE_BOOTS) {
+        const esp_partition_t* other = esp_ota_get_next_update_partition(NULL);
+        storage.setOtaPending(false);
+        storage.setBootTries(0);
+        otaConfirmPending = false;
+        if (partitionHasImage(other) && esp_ota_set_boot_partition(other) == ESP_OK) {
+            Serial.println("⏪ Update is unstable -> rolling back to the previous firmware");
+            delay(300);
+            ESP.restart();
+        }
+    }
+}
+
+// Restart that was requested on purpose: do not count it as an unstable start
+void cleanRestart(unsigned long waitMs) {
+    if (otaConfirmPending) {
+        int t = storage.getBootTries();
+        storage.setBootTries(t > 0 ? t - 1 : 0);
+    }
+    delay(waitMs);
+    ESP.restart();
+}
+
 // Leaving Wi-Fi mode: restart instead of re-initialising BLE in place. A fresh boot gives the
 // radio/BT stack a clean state (and sets the 80 MHz clock). No pairing flag is set, so the
 // pairing window stays closed unless keys are missing.
 void returnToBleMode() {
     Serial.println("🔵 Returning to BLE Keyless Mode (clean restart)...");
-    delay(250);
-    ESP.restart();
+    cleanRestart(250);
 }
 
 // ============================================================================
@@ -502,12 +549,16 @@ void setup() {
 
     Serial.begin(115200);
     delay(300);
-    Serial.println("\n=== ESPKV7 Wuling Confero BLE Keyless v1.2 (Fleet 30+30) Starting ===");
+    Serial.printf("\n=== ESPKV7 BLE Keyless v%s (Fleet 30+30) Starting ===\n", FW_VERSION);
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    if (running) Serial.printf("Running from firmware slot: %s\n", running->label);
 
     storage.begin();
     Serial.printf("Loaded %d/%d IRK phone(s) and %d/%d passive key(s) from NVS\n",
                   storage.irkCount, MAX_IRK_DEVICES,
                   storage.passiveCount, MAX_PASSIVE_KEYS);
+
+    bootGuardOnBoot();   // may roll back an unstable firmware update and restart
 
     // Watchdog: reboot if loop() stops checking in for WDT_TIMEOUT_S seconds
     esp_err_t wdtErr = esp_task_wdt_init(WDT_TIMEOUT_S, true);
@@ -525,6 +576,13 @@ void setup() {
 void loop() {
     esp_task_wdt_reset();
     checkWifiToggleButton();
+
+    if (otaConfirmPending && millis() > OTA_CONFIRM_AFTER_MS) {
+        otaConfirmPending = false;
+        storage.setOtaPending(false);
+        storage.setBootTries(0);
+        Serial.println("✅ Firmware update confirmed stable");
+    }
 
     // ------------------------------------------------------------------------
     // Mode A: Wi-Fi Dashboard Mode (LED blinks every 500 ms, 3-min timeout)
@@ -551,11 +609,23 @@ void loop() {
             wifiManager.resumeAfterBleScan();
         }
 
+        if (wifiManager.otaRebootRequested) {
+            Serial.println("✅ Firmware installed -> restarting into the new version (trial start)");
+            delay(800);   // let the browser receive the response
+            ESP.restart();
+        }
+
+        if (wifiManager.factoryResetRequested) {
+            Serial.println("🧹 Factory reset: erasing all keys and settings...");
+            delay(300);
+            storage.factoryReset();
+            ESP.restart();
+        }
+
         if (wifiManager.rebootRequested) {
             Serial.println("🔄 Rebooting to open 30s BLE pairing window...");
             storage.setPairRequest(true);   // consumed (and cleared) on next boot
-            delay(350);
-            ESP.restart();
+            cleanRestart(350);
         }
 
         if (wifiManager.resumeBleRequested || wifiManager.isTimedOut()) {
@@ -589,6 +659,14 @@ void loop() {
                     unsigned long left = (PAIRING_WINDOW_MS - (millis() - bootTimeMs)) / 1000;
                     Serial.printf("⏳ Pairing window open (%lus left before proximity scan starts)...\n", left);
                 }
+            }
+            // Fast LED blink = pairing window is open
+            static unsigned long lastPairBlinkMs = 0;
+            static bool pairBlinkState = false;
+            if (millis() - lastPairBlinkMs >= 150) {
+                lastPairBlinkMs = millis();
+                pairBlinkState = !pairBlinkState;
+                setLed(pairBlinkState);
             }
             delay(50);
             return;
