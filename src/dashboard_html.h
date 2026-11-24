@@ -464,128 +464,224 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       border-top: 1px solid var(--border);
     }
 
-    /* Dual-Thumb RSSI Hysteresis Slider */
-    .rssi-panel {
-      background: #0b101b;
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      padding: 12px;
-      margin-bottom: 12px;
-    }
-
-    .rssi-readout {
+    /* Signal Threshold Controls */
+    .live-meter-head {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 12px;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+
+    .live-meter-dev {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .live-meter-val {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12.5px;
+      font-weight: 700;
+      color: var(--sky);
+      flex-shrink: 0;
+    }
+
+    .meter-wrap {
+      position: relative;
+      height: 24px;
+      background: #0b101b;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin: 20px 0 6px;
+    }
+
+    .meter-fill {
+      height: 100%;
+      width: 0%;
+      border-radius: 7px;
+      background: linear-gradient(90deg, var(--rose) 0%, var(--amber) 45%, var(--emerald) 100%);
+      transition: width 0.25s ease;
+    }
+
+    .marker {
+      position: absolute;
+      top: -5px;
+      bottom: -5px;
+      width: 3px;
+      border-radius: 2px;
+      transform: translateX(-50%);
+      transition: left 0.15s ease;
+      z-index: 3;
+    }
+
+    .marker.unlock { background: var(--emerald); }
+    .marker.lock { background: var(--amber); }
+
+    .marker-label {
+      position: absolute;
+      top: -17px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 10px;
+      font-weight: 700;
+      white-space: nowrap;
+      padding: 1px 5px;
+      border-radius: 4px;
       font-variant-numeric: tabular-nums;
     }
 
-    .rssi-endpoint {
-      display: flex;
-      flex-direction: column;
-    }
-
-    .rssi-endpoint.right {
-      text-align: right;
-    }
-
-    .rssi-endpoint span {
-      font-size: 10.5px;
-      color: var(--dim);
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-
-    .rssi-endpoint strong {
-      font-size: 14px;
-      font-weight: 700;
-    }
-
-    .rssi-endpoint.lock strong { color: var(--amber); }
-    .rssi-endpoint.unlock strong { color: var(--emerald); }
-
-    .hyst-pill {
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--muted);
-      background: rgba(255, 255, 255, 0.05);
-      padding: 3px 8px;
-      border-radius: 999px;
-    }
-
-    .dual-slider {
-      position: relative;
-      height: 28px;
-      display: flex;
-      align-items: center;
-    }
-
-    .slider-track {
-      position: absolute;
-      width: 100%;
-      height: 6px;
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.09);
-    }
-
-    .slider-range {
-      position: absolute;
-      height: 6px;
-      border-radius: 999px;
-      background: linear-gradient(90deg, var(--amber), var(--emerald));
-    }
-
-    .dual-slider input[type="range"] {
-      position: absolute;
-      width: 100%;
-      height: 28px;
-      background: none;
-      pointer-events: none;
-      -webkit-appearance: none;
-      appearance: none;
-      margin: 0;
-    }
-
-    .dual-slider input[type="range"]::-webkit-slider-thumb {
-      -webkit-appearance: none;
-      appearance: none;
-      pointer-events: auto;
-      width: 20px;
-      height: 20px;
-      border-radius: 50%;
-      background: #f8fafc;
-      cursor: grab;
-      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.55);
-      transition: transform 0.1s;
-    }
-
-    .dual-slider input[type="range"]::-webkit-slider-thumb:active {
-      cursor: grabbing;
-      transform: scale(1.12);
-    }
-
-    .dual-slider input[type="range"]::-moz-range-thumb {
-      pointer-events: auto;
-      width: 20px;
-      height: 20px;
-      border-radius: 50%;
-      background: #f8fafc;
-      cursor: grab;
-      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.55);
-    }
-
-    #inLockRssi::-webkit-slider-thumb { border: 3px solid var(--amber); }
-    #inUnlockRssi::-webkit-slider-thumb { border: 3px solid var(--emerald); }
-    #inLockRssi::-moz-range-thumb { border: 3px solid var(--amber); }
-    #inUnlockRssi::-moz-range-thumb { border: 3px solid var(--emerald); }
+    .marker.unlock .marker-label { background: var(--emerald-bg); color: var(--emerald); }
+    .marker.lock .marker-label { background: var(--amber-bg); color: var(--amber); }
 
     .slider-scale {
       display: flex;
       justify-content: space-between;
       font-size: 10.5px;
       color: var(--dim);
-      margin-top: 2px;
+      margin-bottom: 12px;
+    }
+
+    .preset-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 7px;
+      margin-bottom: 12px;
+    }
+
+    .preset-btn {
+      flex-direction: column;
+      gap: 2px;
+      background: #0b101b;
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 6px;
+      font-size: 12px;
+    }
+
+    .preset-btn span {
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--dim);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .preset-btn.active {
+      border-color: var(--sky);
+      background: var(--sky-bg);
+    }
+
+    .thresh-box {
+      background: #0b101b;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 10px 12px;
+      margin-bottom: 10px;
+    }
+
+    .thresh-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .thresh-lbl {
+      font-size: 12px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .dot-ind {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+    }
+
+    .dot-ind.unlock { background: var(--emerald); }
+    .dot-ind.lock { background: var(--amber); }
+
+    .thresh-val {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11.5px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+
+    .thresh-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .thresh-row input[type="range"] {
+      flex: 1;
+      height: 6px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.1);
+      -webkit-appearance: none;
+      appearance: none;
+      outline: none;
+    }
+
+    .thresh-row input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #f8fafc;
+      cursor: grab;
+      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.5);
+    }
+
+    #inUnlockRssi::-webkit-slider-thumb { border: 3px solid var(--emerald); }
+    #inLockRssi::-webkit-slider-thumb { border: 3px solid var(--amber); }
+
+    .btn-set-here {
+      background: var(--sky-bg);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      color: var(--sky);
+      padding: 5px 9px;
+      font-size: 11px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .delay-pills {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 5px;
+    }
+
+    .delay-pill {
+      background: #0b101b;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 7px 4px;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .delay-pill.active {
+      background: var(--sky-bg);
+      border-color: var(--sky);
+      color: var(--sky);
+    }
+
+    .guard-note {
+      font-size: 11px;
+      color: var(--amber);
+      background: var(--amber-bg);
+      border-radius: 7px;
+      padding: 6px 9px;
+      margin-bottom: 10px;
     }
 
     /* Buttons */
@@ -1050,54 +1146,104 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         </div>
       </section>
 
-      <!-- Collapsible Drawer 1: Proximity Thresholds -->
+      <!-- Collapsible Drawer 1: Signal Thresholds & Sensitivity -->
       <details class="drawer" id="drawerProx">
         <summary>
-          <span class="drawer-title">Proximity Thresholds</span>
+          <span class="drawer-title">Signal Thresholds &amp; Sensitivity</span>
           <span class="drawer-preview">
             <span id="proxPreview">-70 / -85 dBm · 15s</span>
             <span class="chevron">▾</span>
           </span>
         </summary>
         <div class="drawer-content">
-          <!-- Dual-Thumb RSSI Slider (Minimum 15 dB Hysteresis Gap) -->
-          <div class="rssi-panel">
-            <div class="rssi-readout">
-              <div class="rssi-endpoint lock">
-                <span>Lock (Far)</span>
-                <strong id="lockRssiVal">-85 dBm</strong>
-              </div>
-              <span class="hyst-pill" id="hystGapVal">15 dB buffer</span>
-              <div class="rssi-endpoint unlock right">
-                <span>Unlock (Close)</span>
-                <strong id="unlockRssiVal">-70 dBm</strong>
-              </div>
-            </div>
-
-            <div class="dual-slider">
-              <div class="slider-track"></div>
-              <div class="slider-range" id="rssiRangeFill"></div>
-              <input type="range" id="inLockRssi" min="-95" max="-40" step="1" value="-85" oninput="syncRssiSliders('lock')" />
-              <input type="range" id="inUnlockRssi" min="-95" max="-40" step="1" value="-70" oninput="syncRssiSliders('unlock')" />
-            </div>
-
-            <div class="slider-scale">
-              <span>-95 dBm (Far)</span>
-              <span>-40 dBm (Near)</span>
+          <!-- Live Signal Meter -->
+          <div class="live-meter-head">
+            <span class="live-meter-dev" id="liveMeterDev">Last detected: --</span>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <span class="live-meter-val" id="liveMeterRssi">-- dBm</span>
+              <button type="button" class="btn-set-here" id="btnMeasureRssi" onclick="measureLiveRssi()">📡 Measure</button>
             </div>
           </div>
 
-          <div class="form-grid">
+          <div class="meter-wrap">
+            <div class="meter-fill" id="liveMeterFill"></div>
+            <div class="marker lock" id="lockMarker">
+              <span class="marker-label" id="lockMarkerLbl">Lock -85</span>
+            </div>
+            <div class="marker unlock" id="unlockMarker">
+              <span class="marker-label" id="unlockMarkerLbl">Unlock -70</span>
+            </div>
+          </div>
+
+          <div class="slider-scale">
+            <span>-100 dBm (Weak)</span>
+            <span id="hystGapVal">15 dB buffer</span>
+            <span>-40 dBm (Strong)</span>
+          </div>
+
+          <!-- Quick Presets -->
+          <div class="preset-grid">
+            <button type="button" class="preset-btn" id="presetClose" onclick="applyDistPreset(-62, -78, 'presetClose')">
+              Close
+              <span>-62 / -78 dBm</span>
+            </button>
+            <button type="button" class="preset-btn" id="presetBalanced" onclick="applyDistPreset(-70, -85, 'presetBalanced')">
+              Balanced
+              <span>-70 / -85 dBm</span>
+            </button>
+            <button type="button" class="preset-btn" id="presetFar" onclick="applyDistPreset(-78, -92, 'presetFar')">
+              Far
+              <span>-78 / -92 dBm</span>
+            </button>
+          </div>
+
+          <div class="guard-note hidden" id="guardNote">
+            Minimum 15 dB gap enforced between Unlock and Lock to prevent signal bounce.
+          </div>
+
+          <!-- Unlock Signal Threshold -->
+          <div class="thresh-box">
+            <div class="thresh-top">
+              <span class="thresh-lbl"><span class="dot-ind unlock"></span>Unlock Signal Threshold</span>
+              <span class="thresh-val" id="unlockRssiVal">-70 dBm</span>
+            </div>
+            <div class="thresh-row">
+              <input type="range" id="inUnlockRssi" min="-85" max="-40" step="1" value="-70" oninput="syncRssiSliders('unlock')" />
+              <button type="button" class="btn-set-here" id="btnSetUnlock" onclick="setThresholdHere('unlock')" disabled>📍 Set Here</button>
+            </div>
+          </div>
+
+          <!-- Lock Signal Threshold -->
+          <div class="thresh-box">
+            <div class="thresh-top">
+              <span class="thresh-lbl"><span class="dot-ind lock"></span>Lock Signal Threshold</span>
+              <span class="thresh-val" id="lockRssiVal">-85 dBm</span>
+            </div>
+            <div class="thresh-row">
+              <input type="range" id="inLockRssi" min="-100" max="-55" step="1" value="-85" oninput="syncRssiSliders('lock')" />
+              <button type="button" class="btn-set-here" id="btnSetLock" onclick="setThresholdHere('lock')" disabled>📍 Set Here</button>
+            </div>
+          </div>
+
+          <!-- Walk-Away Lock Delay & Weak Scans -->
+          <div class="form-grid" style="align-items: end;">
             <div class="field">
-              <label>Lock Delay (sec)</label>
-              <input type="number" id="inLockDelay" value="15" />
+              <label>Walk-Away Lock Delay</label>
+              <input type="hidden" id="inLockDelay" value="15" />
+              <div class="delay-pills">
+                <button type="button" class="delay-pill" data-sec="5" onclick="selectLockDelay(5)">5s</button>
+                <button type="button" class="delay-pill" data-sec="10" onclick="selectLockDelay(10)">10s</button>
+                <button type="button" class="delay-pill active" data-sec="15" onclick="selectLockDelay(15)">15s</button>
+                <button type="button" class="delay-pill" data-sec="30" onclick="selectLockDelay(30)">30s</button>
+              </div>
             </div>
             <div class="field">
               <label>Weak Scans Count</label>
-              <input type="number" id="inWeakScans" value="8" />
+              <input type="number" id="inWeakScans" min="2" max="30" value="8" />
             </div>
           </div>
-          <button type="button" class="btn-primary" onclick="saveProximity()">Save Thresholds</button>
+
+          <button type="button" class="btn-primary" onclick="saveProximity()">Save Signal Settings</button>
         </div>
       </details>
 
@@ -1244,6 +1390,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
     let secs = 180;
     let fwBusy = false;
     let lastTouchMs = 0;
+    let liveSignalRssi = null;
     const armTimers = {};
 
     /* ---------- Views ---------- */
@@ -1303,34 +1450,116 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       document.getElementById("btnToggleAddPassive").classList.toggle("hidden", show);
     }
 
+    /* ---------- Signal Threshold Helpers ---------- */
+    function rssiToMeterPct(rssi) {
+      return Math.max(0, Math.min(100, ((rssi + 100) / 60) * 100));
+    }
+
+    function clearDistPresetHighlight() {
+      document.querySelectorAll(".preset-btn").forEach(b => b.classList.remove("active"));
+    }
+
     function syncRssiSliders(activeThumb) {
       const lockEl = document.getElementById("inLockRssi");
       const unlockEl = document.getElementById("inUnlockRssi");
-      const min = -95, max = -40, minGap = 15;
+      const minGap = 15;
 
       let lockVal = parseInt(lockEl.value, 10);
       let unlockVal = parseInt(unlockEl.value, 10);
+      let clamped = false;
+
+      if (activeThumb) clearDistPresetHighlight();
 
       if (activeThumb === "lock" && lockVal > unlockVal - minGap) {
+        unlockVal = Math.min(-40, lockVal + minGap);
         lockVal = unlockVal - minGap;
         lockEl.value = lockVal;
-      } else if (activeThumb === "unlock" && unlockVal < lockVal + minGap) {
-        unlockVal = lockVal + minGap;
         unlockEl.value = unlockVal;
+        clamped = true;
+      } else if (activeThumb === "unlock" && unlockVal < lockVal + minGap) {
+        lockVal = Math.max(-100, unlockVal - minGap);
+        unlockVal = lockVal + minGap;
+        lockEl.value = lockVal;
+        unlockEl.value = unlockVal;
+        clamped = true;
       }
 
-      lockEl.style.zIndex = activeThumb === "lock" ? 3 : 2;
-      unlockEl.style.zIndex = activeThumb === "unlock" ? 3 : 2;
-
-      const lockPct = ((lockVal - min) / (max - min)) * 100;
-      const unlockPct = ((unlockVal - min) / (max - min)) * 100;
-      const fill = document.getElementById("rssiRangeFill");
-      fill.style.left = lockPct + "%";
-      fill.style.width = (unlockPct - lockPct) + "%";
+      if (activeThumb) {
+        document.getElementById("guardNote").classList.toggle("hidden", !clamped);
+      }
 
       document.getElementById("lockRssiVal").textContent = `${lockVal} dBm`;
       document.getElementById("unlockRssiVal").textContent = `${unlockVal} dBm`;
       document.getElementById("hystGapVal").textContent = `${unlockVal - lockVal} dB buffer`;
+
+      document.getElementById("lockMarker").style.left = rssiToMeterPct(lockVal) + "%";
+      document.getElementById("unlockMarker").style.left = rssiToMeterPct(unlockVal) + "%";
+      document.getElementById("lockMarkerLbl").textContent = `Lock ${lockVal}`;
+      document.getElementById("unlockMarkerLbl").textContent = `Unlock ${unlockVal}`;
+    }
+
+    function applyDistPreset(u, l, btnId) {
+      document.getElementById("inUnlockRssi").value = u;
+      document.getElementById("inLockRssi").value = l;
+      clearDistPresetHighlight();
+      if (btnId) document.getElementById(btnId).classList.add("active");
+      document.getElementById("guardNote").classList.add("hidden");
+      syncRssiSliders();
+    }
+
+    function setThresholdHere(target) {
+      if (liveSignalRssi === null) return;
+      if (target === "unlock") {
+        const val = Math.max(-85, Math.min(-40, liveSignalRssi));
+        document.getElementById("inUnlockRssi").value = val;
+        syncRssiSliders("unlock");
+        showToast(`Unlock set to ${val} dBm`);
+      } else {
+        const val = Math.max(-100, Math.min(-55, liveSignalRssi));
+        document.getElementById("inLockRssi").value = val;
+        syncRssiSliders("lock");
+        showToast(`Lock set to ${val} dBm`);
+      }
+    }
+
+    async function measureLiveRssi() {
+      const btn = document.getElementById("btnMeasureRssi");
+      if (!btn) return;
+      btn.disabled = true;
+      btn.textContent = "Measuring...";
+      showToast("Measuring authorized key signal for 3s...");
+
+      try {
+        await fetch("/api/live-rssi", { method: "POST" });
+      } catch (e) {}
+
+      // Wait 3.6s for the 3s BLE burst + SoftAP resume to complete
+      setTimeout(async () => {
+        await loadState();
+        btn.disabled = false;
+        btn.textContent = "📡 Measure";
+
+        if (st && typeof st.liveRssiMedian === "number" && st.liveRssiMedian > -120) {
+          liveSignalRssi = st.liveRssiMedian;
+          const samples = st.liveRssiSamples || 1;
+          document.getElementById("liveMeterDev").textContent =
+            `${st.liveRssiDevice || "Authorized Key"} (${samples} sample${samples === 1 ? "" : "s"})`;
+          document.getElementById("liveMeterRssi").textContent = `${st.liveRssiMedian} dBm`;
+          document.getElementById("liveMeterFill").style.width = rssiToMeterPct(st.liveRssiMedian) + "%";
+          document.getElementById("btnSetUnlock").disabled = false;
+          document.getElementById("btnSetLock").disabled = false;
+          showToast(`Median signal: ${st.liveRssiMedian} dBm`);
+        } else {
+          showToast("No enabled phone/watch detected nearby");
+        }
+      }, 3600);
+    }
+
+    function selectLockDelay(sec) {
+      document.getElementById("inLockDelay").value = sec;
+      document.querySelectorAll(".delay-pill").forEach(btn => {
+        btn.classList.toggle("active", parseInt(btn.dataset.sec, 10) === sec);
+      });
     }
 
     function escHtml(s) {
@@ -1474,17 +1703,35 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         actEl.className = "metric-val" + (data.lastAction === "Unlock" ? " unlocked" : "");
 
         document.getElementById("statActiveKey").textContent = data.lastDeviceName || "--";
+        const hasValidRssi = data.lastRssi && data.lastRssi > -120;
         document.getElementById("statPeakRssi").textContent =
-          data.lastRssi && data.lastRssi > -120 ? `${data.lastRssi} dBm` : "-- dBm";
+          hasValidRssi ? `${data.lastRssi} dBm` : "-- dBm";
+
+        if (hasValidRssi) {
+          liveSignalRssi = data.lastRssi;
+          document.getElementById("liveMeterDev").textContent =
+            data.lastDeviceName ? `Last detected: ${data.lastDeviceName}` : "Last detected key";
+          document.getElementById("liveMeterRssi").textContent = `${data.lastRssi} dBm`;
+          document.getElementById("liveMeterFill").style.width = rssiToMeterPct(data.lastRssi) + "%";
+          document.getElementById("btnSetUnlock").disabled = false;
+          document.getElementById("btnSetLock").disabled = false;
+        } else {
+          liveSignalRssi = null;
+          document.getElementById("liveMeterDev").textContent = "Last detected: --";
+          document.getElementById("liveMeterRssi").textContent = "-- dBm";
+          document.getElementById("liveMeterFill").style.width = "0%";
+          document.getElementById("btnSetUnlock").disabled = true;
+          document.getElementById("btnSetLock").disabled = true;
+        }
 
         if (data.settings) {
           document.getElementById("inUnlockRssi").value = data.settings.unlockRssi;
           document.getElementById("inLockRssi").value = data.settings.lockRssi;
-          document.getElementById("inLockDelay").value = data.settings.lockTimeoutSec;
+          selectLockDelay(data.settings.lockTimeoutSec);
           document.getElementById("inWeakScans").value = data.settings.weakSignalCount;
           document.getElementById("proxPreview").textContent =
             `${data.settings.unlockRssi} / ${data.settings.lockRssi} dBm · ${data.settings.lockTimeoutSec}s`;
-          syncRssiSliders("unlock");
+          syncRssiSliders();
 
           const savedSsid = data.settings.wifiSsid || "";
           document.getElementById("wifiPreview").textContent = savedSsid || "AP Only";
@@ -1631,7 +1878,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         unlockRssi, lockRssi, lockTimeoutSec, weakSignalCount
       });
       document.getElementById("drawerProx").removeAttribute("open");
-      showToast("Proximity thresholds saved");
+      showToast("Signal settings saved");
       loadState();
     }
 
@@ -1827,7 +2074,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
     }, 1000);
 
     navigate(currentRoute(), false);
-    syncRssiSliders("unlock");
+    syncRssiSliders();
     loadState();
   </script>
 </body>

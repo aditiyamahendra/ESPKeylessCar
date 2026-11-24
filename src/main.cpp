@@ -305,6 +305,117 @@ void captureNearbyBleSnapshot(uint32_t seconds) {
 }
 
 // ============================================================================
+// Live Authorized Key RSSI Measurement (3-Second Median Burst)
+// ============================================================================
+static const int MAX_LIVE_SAMPLES = 32;
+static int liveSamples[MAX_LIVE_SAMPLES];
+static int liveSampleCount = 0;
+static char liveMatchedName[28] = {0};
+
+static void liveRssiGapCallback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
+    if (event != ESP_GAP_BLE_SCAN_RESULT_EVT) return;
+    if (param->scan_rst.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) return;
+
+    uint8_t* bda = param->scan_rst.bda;
+    int rssi = param->scan_rst.rssi;
+    const char* matched = nullptr;
+
+    // 1. Check enabled bonded IRK phones
+    for (int d = 0; d < MAX_IRK_DEVICES; d++) {
+        if (!storage.irkDevices[d].used || !storage.irkDevices[d].enabled) continue;
+        if (verifyRPA(bda, storage.irkDevices[d].irk)) {
+            matched = storage.irkDevices[d].name;
+            break;
+        }
+    }
+
+    // 2. Check enabled static-MAC watches / passive keys
+    if (!matched) {
+        for (int k = 0; k < MAX_PASSIVE_KEYS; k++) {
+            if (!storage.passiveKeys[k].used || !storage.passiveKeys[k].enabled) continue;
+            if (memcmp(bda, storage.passiveKeys[k].mac, 6) == 0) {
+                matched = storage.passiveKeys[k].name;
+                break;
+            }
+        }
+    }
+
+    if (!matched) return;
+
+    // Lock onto the first authorized key detected in this burst
+    if (liveMatchedName[0] == '\0') {
+        strncpy(liveMatchedName, matched, sizeof(liveMatchedName) - 1);
+        liveMatchedName[sizeof(liveMatchedName) - 1] = '\0';
+    } else if (strncmp(liveMatchedName, matched, sizeof(liveMatchedName)) != 0) {
+        return;
+    }
+
+    if (liveSampleCount < MAX_LIVE_SAMPLES) {
+        liveSamples[liveSampleCount++] = rssi;
+    }
+}
+
+void measureAuthorizedKeyRssi(uint32_t seconds) {
+    Serial.printf("📡 Measuring authorized key RSSI for %lus...\n", (unsigned long)seconds);
+    liveSampleCount = 0;
+    liveMatchedName[0] = '\0';
+
+    if (!BLEDevice::getInitialized()) {
+        BLEDevice::init("");
+    }
+
+    esp_ble_scan_params_t scanParams = {};
+    scanParams.scan_type = BLE_SCAN_TYPE_PASSIVE;
+    scanParams.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+    scanParams.scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL;
+    scanParams.scan_interval = 160;   // 100 ms interval
+    scanParams.scan_window = 64;      // 40 ms window (40% duty cycle, safe with Wi-Fi AP)
+    scanParams.scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE;
+
+    esp_ble_gap_register_callback(liveRssiGapCallback);
+    esp_ble_gap_set_scan_params(&scanParams);
+    delay(30);
+    esp_ble_gap_start_scanning(seconds);
+
+    unsigned long scanStart = millis();
+    while (millis() - scanStart < (unsigned long)seconds * 1000UL) {
+        if (isWifiMode) {
+            wifiManager.server.handleClient();
+        }
+        esp_task_wdt_reset();
+        delay(25);
+    }
+    esp_ble_gap_stop_scanning();
+
+    if (liveSampleCount > 0) {
+        // Insertion sort to find the median RSSI
+        for (int i = 1; i < liveSampleCount; i++) {
+            int key = liveSamples[i];
+            int j = i - 1;
+            while (j >= 0 && liveSamples[j] > key) {
+                liveSamples[j + 1] = liveSamples[j];
+                j--;
+            }
+            liveSamples[j + 1] = key;
+        }
+        int median = liveSamples[liveSampleCount / 2];
+        wifiManager.liveRssiDevice = String(liveMatchedName);
+        wifiManager.liveRssiMedian = median;
+        wifiManager.liveRssiSamples = liveSampleCount;
+        wifiManager.lastDeviceName = wifiManager.liveRssiDevice;
+        wifiManager.lastRssi = median;
+        Serial.printf("📊 Live RSSI (%s): %d dBm across %d sample(s)\n",
+                      liveMatchedName, median, liveSampleCount);
+    } else {
+        wifiManager.liveRssiDevice = "";
+        wifiManager.liveRssiMedian = -127;
+        wifiManager.liveRssiSamples = 0;
+        Serial.println("📊 Live RSSI: No enabled authorized key detected");
+    }
+    wifiManager.liveRssiBusy = false;
+}
+
+// ============================================================================
 // BLE Server & PIN-Less "Just Works" Pairing Callbacks
 // ============================================================================
 class PairingServerCallbacks : public BLEServerCallbacks {
@@ -641,6 +752,15 @@ void loop() {
             delay(30);
             wifiManager.suspendForBleScan();
             captureNearbyBleSnapshot(3);
+            wifiManager.resumeAfterBleScan();
+        }
+
+        // Timed 3-second authorized key RSSI burst when user clicks "Measure"
+        if (wifiManager.liveRssiRequested) {
+            wifiManager.liveRssiRequested = false;
+            delay(30);
+            wifiManager.suspendForBleScan();
+            measureAuthorizedKeyRssi(3);
             wifiManager.resumeAfterBleScan();
         }
 

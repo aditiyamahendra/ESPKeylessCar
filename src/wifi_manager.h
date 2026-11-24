@@ -57,6 +57,11 @@ public:
     bool bleRescanRequested = false;
     bool otaRebootRequested = false;
     bool factoryResetRequested = false;
+    bool liveRssiRequested = false;
+    bool liveRssiBusy = false;
+    String liveRssiDevice = "";
+    int liveRssiMedian = -127;
+    int liveRssiSamples = 0;
     OtaUpdater ota;
 
     String lastDeviceName = "";
@@ -305,6 +310,10 @@ public:
             json += "\"lastRssi\":" + String(lastRssi) + ",";
             json += "\"lastAction\":\"" + jsonEscape(lastAction) + "\",";
             json += "\"lastEventTime\":\"" + jsonEscape(lastEventTime) + "\",";
+            json += "\"liveRssiBusy\":" + String(liveRssiBusy ? "true" : "false") + ",";
+            json += "\"liveRssiDevice\":\"" + jsonEscape(liveRssiDevice) + "\",";
+            json += "\"liveRssiMedian\":" + String(liveRssiMedian) + ",";
+            json += "\"liveRssiSamples\":" + String(liveRssiSamples) + ",";
 
             json += "\"settings\":{";
             json += "\"unlockRssi\":" + String(storage->settings.unlockRssi) + ",";
@@ -453,6 +462,16 @@ public:
             resetTimer();
             server.send(200, "application/json", "{\"ok\":true}");
             bleRescanRequested = true;
+        });
+
+        server.on("/api/live-rssi", HTTP_POST, [this]() {
+            resetTimer();
+            liveRssiBusy = true;
+            liveRssiMedian = -127;
+            liveRssiSamples = 0;
+            liveRssiDevice = "";
+            liveRssiRequested = true;
+            server.send(200, "application/json", "{\"ok\":true}");
         });
 
         server.on("/api/reboot-pair", HTTP_POST, [this]() {
