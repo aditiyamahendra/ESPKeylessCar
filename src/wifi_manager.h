@@ -275,6 +275,16 @@ public:
         server.on("/", HTTP_GET, servePage);
         server.on("/firmware", HTTP_GET, servePage);
 
+        auto sendEmpty204 = [this]() {
+            server.send(204, "text/plain", "");
+        };
+        server.on("/favicon.ico", HTTP_GET, sendEmpty204);
+        server.on("/apple-touch-icon.png", HTTP_GET, sendEmpty204);
+        server.on("/apple-touch-icon-precomposed.png", HTTP_GET, sendEmpty204);
+        server.on("/canonical.html", HTTP_GET, sendEmpty204);
+        server.on("/success.txt", HTTP_GET, sendEmpty204);
+        server.on("/fwlink", HTTP_GET, redirectToPortal);
+
         // Keep-alive from the page: the dashboard closes after 3 minutes WITHOUT activity
         server.on("/api/ping", HTTP_POST, [this]() {
             resetTimer();
@@ -524,6 +534,7 @@ public:
         });
 
         server.onNotFound([this, isCaptiveProbe, redirectToPortal]() {
+            Serial.printf("Unmatched URI: %s\n", server.uri().c_str());
             if (isCaptiveProbe()) {
                 redirectToPortal();
                 return;

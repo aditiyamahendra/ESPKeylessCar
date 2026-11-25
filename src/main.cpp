@@ -13,10 +13,10 @@
 #include "wifi_manager.h"
 
 // ============================================================================
-// Hardware Pinout (ESP32-C3 SuperMini -> Wuling Confero K15D BCM)
+// Hardware Pinout (ESP32-C3 SuperMini -> Car Central Lock Module)
 // ============================================================================
-const int LOCK_PIN        = 4;   // Active-LOW Relay IN1 -> K15D Pin 19 (Lock)
-const int UNLOCK_PIN      = 5;   // Active-LOW Relay IN2 -> K15D Pin 18 (Unlock)
+const int LOCK_PIN        = 4;   // Active-LOW Relay IN1 -> Central Lock (Lock)
+const int UNLOCK_PIN      = 5;   // Active-LOW Relay IN2 -> Central Lock (Unlock)
 const int LED_PIN         = 8;   // Onboard Blue LED (Active-LOW)
 const int WIFI_BUTTON_PIN = 9;   // Exterior Push Button / BOOT (INPUT_PULLUP)
 
@@ -88,7 +88,7 @@ void blinkLed(int times, int delayMs) {
 }
 
 void sendLockPulse() {
-    Serial.println("🔒 LOCK pulse sent to Wuling Confero BCM (K15D Pin 19)");
+    Serial.println("🔒 LOCK pulse sent to Central Lock Module");
     digitalWrite(LOCK_PIN, LOW);
     delay(RELAY_PULSE_MS);
     digitalWrite(LOCK_PIN, HIGH);
@@ -96,7 +96,7 @@ void sendLockPulse() {
 }
 
 void sendUnlockPulse() {
-    Serial.println("🔓 UNLOCK pulse sent to Wuling Confero BCM (K15D Pin 18)");
+    Serial.println("🔓 UNLOCK pulse sent to Central Lock Module");
     digitalWrite(UNLOCK_PIN, LOW);
     delay(RELAY_PULSE_MS);
     digitalWrite(UNLOCK_PIN, HIGH);
@@ -203,6 +203,83 @@ KeylessScanCallbacks scanCallbacks;
 // ============================================================================
 // Nearby Static-MAC Snapshot Scanner (For /keys Dropdown)
 // ============================================================================
+static String resolveAdvPayload(uint8_t* payload, uint8_t len, bool& skipBeacon) {
+    if (!payload || len == 0) return "";
+
+    uint8_t nameLen = 0;
+    uint8_t* advName = esp_ble_resolve_adv_data(payload, ESP_BLE_AD_TYPE_NAME_CMPL, &nameLen);
+    if (!advName || nameLen == 0) {
+        advName = esp_ble_resolve_adv_data(payload, ESP_BLE_AD_TYPE_NAME_SHORT, &nameLen);
+    }
+    if (advName && nameLen > 0) {
+        char nameBuf[28];
+        size_t copyLen = nameLen < 27 ? nameLen : 27;
+        memcpy(nameBuf, advName, copyLen);
+        nameBuf[copyLen] = '\0';
+        String devName = String(nameBuf);
+        devName.trim();
+        if (devName.length() > 0) return devName;
+    }
+
+    uint8_t uuidLen = 0;
+    uint8_t* uuid16 = esp_ble_resolve_adv_data(payload, ESP_BLE_AD_TYPE_16SRV_CMPL, &uuidLen);
+    if (!uuid16 || uuidLen < 2) {
+        uuid16 = esp_ble_resolve_adv_data(payload, ESP_BLE_AD_TYPE_16SRV_PART, &uuidLen);
+    }
+    if (uuid16 && uuidLen >= 2) {
+        for (uint8_t i = 0; i + 1 < uuidLen; i += 2) {
+            uint16_t svc = (uint16_t)uuid16[i] | ((uint16_t)uuid16[i + 1] << 8);
+            if (svc == 0xFD6F) { skipBeacon = true; return ""; }
+            if (svc == 0xFEE0 || svc == 0xFEE1) return "Mi / Amazfit Watch";
+            if (svc == 0x180D) return "HR Fitness Watch";
+            if (svc == 0x1812) return "BLE HID Remote";
+        }
+    }
+
+    uint8_t mfgLen = 0;
+    uint8_t* mfgData = esp_ble_resolve_adv_data(payload, ESP_BLE_AD_MANUFACTURER_SPECIFIC_TYPE, &mfgLen);
+    if (mfgData && mfgLen >= 2) {
+        uint16_t companyId = (uint16_t)mfgData[0] | ((uint16_t)mfgData[1] << 8);
+        switch (companyId) {
+            case 0x038F: return "Xiaomi Device";
+            case 0x0157: return "Amazfit / Zepp";
+            case 0x027D: return "Huawei Device";
+            case 0x0075: return "Samsung Device";
+            case 0x004C: return "Apple Device";
+            case 0x00E0: return "Google Device";
+            case 0x0059: return "RTOS Watch (Nordic)";
+            case 0x534C:
+            case 0x0822: return "Haylou / Liesheng";
+            default: {
+                char buf[24];
+                snprintf(buf, sizeof(buf), "BLE [0x%04X]", companyId);
+                return String(buf);
+            }
+        }
+    }
+
+    return "";
+}
+
+static String resolveOuiHint(const uint8_t bda[6]) {
+    uint32_t oui = ((uint32_t)bda[0] << 16) | ((uint32_t)bda[1] << 8) | bda[2];
+    switch (oui) {
+        case 0xC45781:
+        case 0xA4C138:
+        case 0x582D34:
+        case 0x7C1DD9:
+            return "Xiaomi / Wear";
+        case 0xE89F6D:
+        case 0xD003DF:
+            return "Amazfit / Huami";
+        case 0xACBC32:
+        case 0xF01898:
+            return "Apple Device";
+        default:
+            return "BLE Device";
+    }
+}
+
 static void snapshotGapCallback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
     if (event != ESP_GAP_BLE_SCAN_RESULT_EVT) return;
     if (param->scan_rst.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) return;
@@ -210,30 +287,24 @@ static void snapshotGapCallback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_par
     uint8_t* bda = param->scan_rst.bda;
     esp_ble_addr_type_t addrType = param->scan_rst.ble_addr_type;
 
-    // Filter out rotating RPAs (random address with top 2 bits == 01)
-    if (addrType == BLE_ADDR_TYPE_RANDOM && (bda[0] & 0xC0) == 0x40) {
+    // Keep only static addresses: Public (0x00) or Random Static (top 2 bits == 11 / 0xC0)
+    if (addrType != BLE_ADDR_TYPE_PUBLIC && (bda[0] & 0xC0) != 0xC0) {
         return;
+    }
+
+    bool skipBeacon = false;
+    String devName = resolveAdvPayload(param->scan_rst.ble_adv, param->scan_rst.adv_data_len, skipBeacon);
+    if (!skipBeacon && devName.length() == 0 && param->scan_rst.scan_rsp_len > 0) {
+        devName = resolveAdvPayload(param->scan_rst.ble_adv + param->scan_rst.adv_data_len,
+                                    param->scan_rst.scan_rsp_len, skipBeacon);
+    }
+    if (skipBeacon) return;
+    if (devName.length() == 0) {
+        devName = resolveOuiHint(bda);
     }
 
     String macStr = StorageManager::macToString(bda);
     int rssi = param->scan_rst.rssi;
-
-    uint8_t nameLen = 0;
-    uint8_t* advName = esp_ble_resolve_adv_data(param->scan_rst.ble_adv, ESP_BLE_AD_TYPE_NAME_CMPL, &nameLen);
-    if (!advName || nameLen == 0) {
-        advName = esp_ble_resolve_adv_data(param->scan_rst.ble_adv, ESP_BLE_AD_TYPE_NAME_SHORT, &nameLen);
-    }
-
-    String devName = "BLE Device";
-    if (advName && nameLen > 0) {
-        char nameBuf[28];
-        size_t copyLen = nameLen < 27 ? nameLen : 27;
-        memcpy(nameBuf, advName, copyLen);
-        nameBuf[copyLen] = '\0';
-        devName = String(nameBuf);
-        devName.trim();
-        if (devName.length() == 0) devName = "BLE Device";
-    }
 
     // Update if MAC already seen in this scan
     for (int i = 0; i < wifiManager.nearbyBleCount; i++) {
@@ -279,7 +350,7 @@ void captureNearbyBleSnapshot(uint32_t seconds) {
     esp_ble_gap_register_callback(snapshotGapCallback);
     esp_ble_gap_set_scan_params(&scanParams);
     delay(30);
-    esp_ble_gap_start_scanning(seconds);
+    esp_ble_gap_start_scanning(0);
 
     unsigned long scanStart = millis();
     while (millis() - scanStart < (unsigned long)seconds * 1000UL) {
@@ -375,7 +446,7 @@ void measureAuthorizedKeyRssi(uint32_t seconds) {
     esp_ble_gap_register_callback(liveRssiGapCallback);
     esp_ble_gap_set_scan_params(&scanParams);
     delay(30);
-    esp_ble_gap_start_scanning(seconds);
+    esp_ble_gap_start_scanning(0);
 
     unsigned long scanStart = millis();
     while (millis() - scanStart < (unsigned long)seconds * 1000UL) {
@@ -583,7 +654,6 @@ void enterWifiMode() {
         BLEDevice::getAdvertising()->stop();
     }
     if (pBLEScan != nullptr) {
-    //    pBLEScan->stop();
         pBLEScan->clearResults();
     }
 
