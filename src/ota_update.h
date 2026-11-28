@@ -8,14 +8,17 @@
 #include "mbedtls/ecdsa.h"
 #include "mbedtls/bignum.h"
 #include "ota_pubkey.h"
+#include "version.h"
 
 // ============================================================================
-// Signed over-the-air firmware update.
+// Signed over-the-air firmware update with application-level anti-rollback.
 //
 // The dashboard uploads the firmware image (without its signature) and passes
 // the 64-byte ECDSA P-256 signature (r||s, hex) in the URL. The image is hashed
-// with SHA-256 while it is written to the inactive OTA slot. The new slot is
-// only made bootable (Update.end) AFTER the signature over that hash verifies.
+// with SHA-256 while it is written to the inactive OTA slot, and scanned for
+// the embedded "ESPKV7_VER:<version>" marker. The new slot is only made
+// bootable (Update.end) AFTER the signature verifies and the version check
+// confirms the incoming firmware is >= FW_VERSION.
 // ============================================================================
 
 #define OTA_SIG_LEN          64
@@ -42,6 +45,9 @@ public:
         succeeded = false;
         lastError = "";
         received = 0;
+        tailLen = 0;
+        foundMetaVersion = false;
+        incomingVersion[0] = '\0';
         started = true;
         failed = false;
         expected = 0;
@@ -68,12 +74,17 @@ public:
     void write(const uint8_t* buf, size_t len) {
         if (!started || failed) return;
         if (received + len > expected) { fail("Image is larger than declared"); return; }
+
+        if (!foundMetaVersion) {
+            scanForMetaMarker(buf, len);
+        }
+
         mbedtls_sha256_update_ret(&sha, buf, len);
         if (Update.write((uint8_t*)buf, len) != len) { fail("Flash write failed"); return; }
         received += len;
     }
 
-    // Called when the upload ends: verify the signature, then (and only then) commit
+    // Called when the upload ends: verify signature + version, then commit
     void finish() {
         if (!started || failed) return;
         if (received != expected) { fail("Upload incomplete"); return; }
@@ -81,6 +92,16 @@ public:
         uint8_t hash[32];
         mbedtls_sha256_finish_ret(&sha, hash);
         if (!verifySignature(hash, sig)) { fail("Signature check failed, update rejected"); return; }
+
+        if (!foundMetaVersion) {
+            fail("Downgrade rejected: legacy or unversioned firmware");
+            return;
+        }
+        if (isOlderThanCurrent(incomingVersion)) {
+            fail("Downgrade rejected: firmware is older than current version");
+            return;
+        }
+
         if (!Update.end(true)) { fail("Could not finalize update"); return; }
 
         succeeded = true;
@@ -93,12 +114,102 @@ public:
     }
 
 private:
+    static constexpr const char* META_MAGIC = "ESPKV7_VER:";
+    static const size_t META_MAGIC_LEN = 11;
+    static const size_t META_MAX_VER_LEN = 20;
+    static const size_t META_SCAN_WINDOW = META_MAGIC_LEN + META_MAX_VER_LEN; // 31
+
     bool started = false;
     bool failed = false;
     bool shaReady = false;
+    bool foundMetaVersion = false;
+    char incomingVersion[META_MAX_VER_LEN + 1];
+    uint8_t tailBuf[META_SCAN_WINDOW];
+    size_t tailLen = 0;
     size_t expected = 0;
     uint8_t sig[OTA_SIG_LEN];
     mbedtls_sha256_context sha;
+
+    bool tryExtractVersion(const uint8_t* data, size_t dataLen) {
+        for (size_t i = 0; i + META_MAGIC_LEN + 1 <= dataLen; i++) {
+            if (memcmp(data + i, META_MAGIC, META_MAGIC_LEN) == 0) {
+                const uint8_t* verStart = data + i + META_MAGIC_LEN;
+                size_t avail = dataLen - (i + META_MAGIC_LEN);
+                size_t copyLen = avail < META_MAX_VER_LEN ? avail : META_MAX_VER_LEN;
+
+                // Wait until we have either the terminating '\0' or all 20 version bytes
+                bool hasNul = false;
+                for (size_t k = 0; k < copyLen; k++) {
+                    if (verStart[k] == '\0') {
+                        hasNul = true;
+                        break;
+                    }
+                }
+                if (!hasNul && avail < META_MAX_VER_LEN) {
+                    return false; // Let the bridge buffer complete it on the next chunk
+                }
+
+                memcpy(incomingVersion, verStart, copyLen);
+                incomingVersion[copyLen] = '\0';
+                foundMetaVersion = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void scanForMetaMarker(const uint8_t* buf, size_t len) {
+        // Check boundary overlap between previous chunk's tail and current chunk
+        if (tailLen > 0) {
+            uint8_t bridge[META_SCAN_WINDOW * 2];
+            size_t take = len < META_SCAN_WINDOW ? len : META_SCAN_WINDOW;
+            memcpy(bridge, tailBuf, tailLen);
+            memcpy(bridge + tailLen, buf, take);
+            if (tryExtractVersion(bridge, tailLen + take)) return;
+        }
+
+        // Scan inside current chunk
+        if (tryExtractVersion(buf, len)) return;
+
+        // Save trailing bytes for next chunk boundary
+        size_t keep = len < (META_SCAN_WINDOW - 1) ? len : (META_SCAN_WINDOW - 1);
+        memcpy(tailBuf, buf + (len - keep), keep);
+        tailLen = keep;
+    }
+
+    static int extractSemver(const char* str, int out[3]) {
+        out[0] = out[1] = out[2] = 0;
+        if (!str) return 0;
+        int idx = 0;
+        const char* p = str;
+        while (*p && idx < 3) {
+            if (*p >= '0' && *p <= '9') {
+                int val = 0;
+                while (*p >= '0' && *p <= '9') {
+                    val = val * 10 + (*p - '0');
+                    p++;
+                }
+                out[idx++] = val;
+            } else {
+                p++;
+            }
+        }
+        return idx;
+    }
+
+    static bool isOlderThanCurrent(const char* incomingVer) {
+        int curNums[3], newNums[3];
+        int curParts = extractSemver(FW_VERSION, curNums);
+        int newParts = extractSemver(incomingVer, newNums);
+        if (newParts < 2) return true;
+        if (curParts < 2) return false;
+
+        for (int i = 0; i < 3; i++) {
+            if (newNums[i] < curNums[i]) return true;
+            if (newNums[i] > curNums[i]) return false;
+        }
+        return false;
+    }
 
     void cleanup() {
         if (shaReady) {

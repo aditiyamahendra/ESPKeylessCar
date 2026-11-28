@@ -11,7 +11,13 @@
 #include "mbedtls/aes.h"
 #include "storage.h"
 #include "wifi_manager.h"
+#include <esp_app_format.h>
+struct __attribute__((packed)) Espkv7FwMeta {
+    char magic[11];      // "ESPKV7_VER:"
+    char version[20];    // e.g. "Beta 2.3.0"
+};
 
+const char espkv7FwMeta[] = "ESPKV7_VER:" FW_VERSION;
 // ============================================================================
 // Hardware Pinout (ESP32-C3 SuperMini -> Car Central Lock Module)
 // ============================================================================
@@ -767,7 +773,7 @@ void setup() {
 
     Serial.begin(115200);
     delay(300);
-    Serial.printf("\n=== ESPKV7 BLE Keyless v%s (Fleet 30+30) Starting ===\n", FW_VERSION);
+    Serial.printf("\n=== ESPKV7 BLE Keyless v%s (Fleet 30+30) Starting ===\n", espkv7FwMeta + 11);
     const esp_partition_t* running = esp_ota_get_running_partition();
     if (running) Serial.printf("Running from firmware slot: %s\n", running->label);
 

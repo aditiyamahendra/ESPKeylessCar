@@ -151,8 +151,33 @@ public:
         // Scan Wi-Fi BEFORE starting SoftAP so channel hopping never drops iOS clients
         scanWifiNetworks();
 
+        bool staConnected = false;
         bool hasSavedWifi = (storage && strlen(storage->settings.wifiSsid) > 0);
-        WiFi.mode(hasSavedWifi ? WIFI_AP_STA : WIFI_AP);
+        if (hasSavedWifi) {
+            // Only attempt STA join if the saved SSID was actually seen in the scan
+            bool ssidVisible = false;
+            for (int i = 0; i < wifiNetworkCount; i++) {
+                if (strcmp(wifiNetworks[i].ssid, storage->settings.wifiSsid) == 0) {
+                    ssidVisible = true;
+                    break;
+                }
+            }
+            if (ssidVisible) {
+                WiFi.setAutoReconnect(false);
+                WiFi.begin(storage->settings.wifiSsid, storage->settings.wifiPass);
+                unsigned long staWaitStart = millis();
+                while (WiFi.status() != WL_CONNECTED && millis() - staWaitStart < 4000) {
+                    esp_task_wdt_reset();
+                    delay(100);
+                }
+                staConnected = (WiFi.status() == WL_CONNECTED);
+            }
+            if (!staConnected) {
+                WiFi.disconnect(false);
+            }
+        }
+
+        WiFi.mode(staConnected ? WIFI_AP_STA : WIFI_AP);
         WiFi.setSleep(true);
 
         IPAddress apIP(192, 168, 4, 1);
@@ -162,19 +187,6 @@ public:
 
         // 15 dBm avoids ESP32-C3 SuperMini antenna overload during iOS WPA2 handshake
         WiFi.setTxPower(WIFI_POWER_15dBm);
-
-        if (hasSavedWifi) {
-            WiFi.setAutoReconnect(false);
-            WiFi.begin(storage->settings.wifiSsid, storage->settings.wifiPass);
-            unsigned long staWaitStart = millis();
-            while (WiFi.status() != WL_CONNECTED && millis() - staWaitStart < 4000) {
-                delay(100);
-            }
-            if (WiFi.status() != WL_CONNECTED) {
-                WiFi.disconnect(false);
-                WiFi.mode(WIFI_AP);
-            }
-        }
 
         // Captive Portal DNS: resolve all domains to 192.168.4.1 so iOS/Android auto-open landing page
         dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
@@ -262,9 +274,17 @@ public:
             server.send(302, "text/plain", "");
         };
 
-        auto servePage = [this, isCaptiveProbe, redirectToPortal]() {
+        auto serveCaptiveDirect = [this]() {
+            resetTimer();
+            server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+            server.sendHeader("Pragma", "no-cache");
+            server.sendHeader("Expires", "-1");
+            server.send_P(200, "text/html", DASHBOARD_HTML);
+        };
+
+        auto servePage = [this, isCaptiveProbe, serveCaptiveDirect]() {
             if (isCaptiveProbe()) {
-                redirectToPortal();
+                serveCaptiveDirect();
                 return;
             }
             resetTimer();
@@ -283,7 +303,7 @@ public:
         server.on("/apple-touch-icon-precomposed.png", HTTP_GET, sendEmpty204);
         server.on("/canonical.html", HTTP_GET, sendEmpty204);
         server.on("/success.txt", HTTP_GET, sendEmpty204);
-        server.on("/fwlink", HTTP_GET, redirectToPortal);
+        server.on("/ts2021", HTTP_GET, sendEmpty204);
 
         // Keep-alive from the page: the dashboard closes after 3 minutes WITHOUT activity
         server.on("/api/ping", HTTP_POST, [this]() {
@@ -293,13 +313,16 @@ public:
             server.send(200, "application/json", String("{\"ok\":true,\"remainingSec\":") + String(rem) + "}");
         });
 
-        // Explicit iOS / Android / Windows captive portal probe endpoints
-        server.on("/hotspot-detect.html", HTTP_GET, redirectToPortal);
-        server.on("/library/test/success.html", HTTP_GET, redirectToPortal);
+        // Serve dashboard HTML directly (200 OK) for iOS Captive Network Assistant
+        server.on("/hotspot-detect.html", HTTP_GET, serveCaptiveDirect);
+        server.on("/library/test/success.html", HTTP_GET, serveCaptiveDirect);
+
+        // Android / Windows captive portal probes
         server.on("/generate_204", HTTP_GET, redirectToPortal);
         server.on("/gen_204", HTTP_GET, redirectToPortal);
         server.on("/ncsi.txt", HTTP_GET, redirectToPortal);
         server.on("/connecttest.txt", HTTP_GET, redirectToPortal);
+        server.on("/fwlink", HTTP_GET, redirectToPortal);
 
         server.on("/api/state", HTTP_GET, [this]() {
             resetTimer();
@@ -533,10 +556,9 @@ public:
             factoryResetRequested = true;
         });
 
-        server.onNotFound([this, isCaptiveProbe, redirectToPortal]() {
-            Serial.printf("Unmatched URI: %s\n", server.uri().c_str());
+        server.onNotFound([this, isCaptiveProbe, serveCaptiveDirect]() {
             if (isCaptiveProbe()) {
-                redirectToPortal();
+                serveCaptiveDirect();
                 return;
             }
             resetTimer();
