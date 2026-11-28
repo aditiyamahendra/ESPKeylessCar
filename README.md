@@ -7,18 +7,21 @@ IRK pairing approach goes to the original author.
 
 This fork adapts the project to an **ESP32-C3 SuperMini** driving a car's
 central-lock module through relays, supports many more keys (including
-smartwatches and beacons), and adds power-saving and safety changes.
+smartwatches and beacons), adds signed over-the-air (OTA) firmware updates with
+anti-rollback protection, and introduces power-saving and safety improvements.
 
 > Sections below the divider are from the original project. Where they describe
 > different hardware, setup steps or passwords, this section applies.
 
 ## What's changed from the original
 
-### Hardware and build (`platformio.ini`)
+### Hardware and build (`platformio.ini`, `partitions_ota.csv`)
 - Target board changed from `esp32dev` to **ESP32-C3 SuperMini**
   (`board = esp32-c3-devkitm-1`), with the platform pinned to `espressif32 @ 6.10.0`.
+- Custom dual-OTA partition table (`partitions_ota.csv`) to support safe
+  over-the-air firmware updates and automatic rollback on boot failure.
 - USB-CDC serial enabled (`ARDUINO_USB_MODE=1`, `ARDUINO_USB_CDC_ON_BOOT=1`).
-- Removed the hardcoded `COM4` upload/monitor ports and the custom upload speed,
+- Removed the hardcoded `COM4` upload/monitor ports and custom upload speed,
   so PlatformIO auto-detects the port.
 
 ### Lock control (`src/main.cpp`)
@@ -36,6 +39,10 @@ smartwatches and beacons), and adds power-saving and safety changes.
   up from 10.
 - **Up to 30 static-MAC "passive keys"** (smartwatches, beacons) that don't
   use IRKs. Each can be added, renamed, enabled/disabled and deleted.
+- **Brand & Device Identification:** Active BLE scanning decodes primary
+  advertising payloads, `SCAN_RSP` packets, Bluetooth Company IDs (e.g. Apple,
+  Samsung, Xiaomi, Haylou/Liesheng, Garmin, Huawei), and static-MAC OUI fallbacks
+  to display readable device names and vendor hints during discovery.
 - A single scan callback checks both key types and uses the strongest match.
 - Pairing uses "Just Works" with no PIN. IRKs are extracted from bonds and the
   Bluedroid bond table is cleared after each extraction, so many devices can
@@ -51,6 +58,20 @@ smartwatches and beacons), and adds power-saving and safety changes.
 - The request is a one-shot flag that is cleared as soon as it is read, so a
   crash or watchdog reboot can never reopen pairing.
 
+### Signed OTA Firmware Updates & Anti-Rollback (`src/ota_update.h`, `tools/ota_tool.py`)
+- **Cryptographic Verification:** Firmware `.espkv7` packages are signed offline
+  with an **ECDSA P-256** private key (`./build_signed.sh`). The ESP32 hashes
+  the incoming image with SHA-256 while streaming it to the inactive OTA slot
+  and only commits the update after verifying the signature against the embedded
+  public key (`src/ota_pubkey.h`).
+- **Application-Level Anti-Rollback:** Each compiled binary embeds an
+  `ESPKV7_VER:<version>` metadata marker in `.rodata` (`src/version.h`). During
+  OTA upload, `OtaUpdater` inspects the incoming image and rejects legacy
+  unversioned builds or any firmware older than the currently running version.
+- **Trial Boot & Automatic Rollback:** Newly flashed firmware starts in a
+  3-boot trial state and automatically reverts to the previous working OTA slot
+  if the device fails to boot cleanly.
+
 ### Wi-Fi dashboard (`src/wifi_manager.h`)
 Rewritten as a self-contained dashboard that replaces the original Wi-Fi manager.
 
@@ -62,20 +83,25 @@ Rewritten as a self-contained dashboard that replaces the original Wi-Fi manager
   settings, configure an optional Wi-Fi client connection (with a scan
   dropdown), and **Reboot to pair**.
 - Page `/keys`: add and manage static-MAC keys, with a "Scan" button that
-  lists nearby BLE devices to pick from.
+  captures a 2-second snapshot of nearby static-MAC BLE devices with resolved
+  names and brand hints.
+- Page `/firmware`: upload signed `.espkv7` firmware packages over Wi-Fi and
+  monitor running slot / version status.
 - Leaving the dashboard (Resume BLE, the button, or the timeout) restarts the
   controller for a clean BLE start. The car's lock state is not remembered
   across restarts, so you may see one extra unlock pulse if a key is nearby.
 
-### Power saving
+### Power saving & coexistence
 - **CPU clock:** 80 MHz during normal keyless operation, 160 MHz only while the
   Wi-Fi dashboard is open.
 - **Adaptive scan duty cycle:** fast scan (100 ms interval / 99 ms window)
   while the car is unlocked or within 2 minutes of a key sighting or lock/unlock
   pulse. Otherwise **eco-scan** (500 ms / 120 ms, about 24% receiver duty).
   Any registered key seen at -90 dBm or stronger switches back to fast scan.
+- **Wi-Fi / BLE Coexistence:** Dynamically adjusts ESP32 radio coexistence
+  preferences (`esp_coex_preference_set`) so BLE scanning never starves the
+  Wi-Fi dashboard or OTA uploads.
 - All timings are constants at the top of `src/main.cpp`.
-- Scanning is passive (no scan requests are transmitted).
 - Not measured: no current-draw figures are claimed.
 
 ### Reliability
@@ -94,16 +120,34 @@ Rewritten as a self-contained dashboard that replaces the original Wi-Fi manager
 git clone https://github.com/aditiyamahendra/ESPKeylessCar
 cd ESPKeylessCar
 
-# Create your private Wi-Fi password file (git-ignored)
+# 1. Create your private Wi-Fi password file (git-ignored)
 cp src/secrets.h.example src/secrets.h
 # edit src/secrets.h and set AP_PASSWORD (8-63 characters)
 
+# 2. Generate your OTA signing keypair (creates git-ignored private key + src/ota_pubkey.h)
+python3 tools/ota_tool.py keygen
+
+# 3. Initial USB flash
 pio run --target upload
 pio device monitor
 ```
 
 The build fails with a clear message if `src/secrets.h` is missing or the
 password length is invalid.
+
+### Building Signed OTA Updates
+
+Once the device is flashed over USB, subsequent updates can be built, signed,
+and uploaded wirelessly via the `/firmware` dashboard page:
+
+```bash
+# Bump FW_VERSION in src/version.h, then run:
+./build_signed.sh
+```
+
+This compiles `.pio/build/esp32-c3-supermini/firmware.bin`, signs it with your
+ECDSA P-256 private key, and saves a versioned `.espkv7` package to
+`signed_firmware/ESPKeyless_DD-MM-YY-<N>.espkv7`.
 
 ## Notes and limitations
 
